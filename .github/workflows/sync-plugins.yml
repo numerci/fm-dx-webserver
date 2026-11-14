@@ -29,26 +29,47 @@ jobs:
             https://github.com/Highpoint2000/LiveMap.git \
             /tmp/LiveMap
 
-      - name: Sync Station Logos
+      - name: Create destination folders
         run: |
           mkdir -p plugins/StationLogos
+          mkdir -p plugins/LiveMap
 
-          rsync -av --delete \
+      - name: Sync Station Logos
+        run: |
+          rsync -av \
             --exclude='/.git/' \
             --exclude='/README.md' \
             --exclude='/LICENSE' \
-            /tmp/StationLogos/ plugins/StationLogos/
+            /tmp/StationLogos/ \
+            plugins/StationLogos/
 
       - name: Sync LiveMap
         run: |
-          mkdir -p plugins/LiveMap
-
-          rsync -av --delete \
+          rsync -av \
             --exclude='/.git/' \
             --exclude='/README.md' \
             --exclude='/LICENSE' \
             --exclude='/LiveMapQuickGuide.pdf' \
-            /tmp/LiveMap/ plugins/LiveMap/
+            /tmp/LiveMap/ \
+            plugins/LiveMap/
+
+      - name: Verify copied files
+        run: |
+          echo "StationLogos files:"
+          find plugins/StationLogos -type f
+
+          echo "LiveMap files:"
+          find plugins/LiveMap -type f
+
+          test -n "$(find plugins/StationLogos -type f -print -quit)" || {
+            echo "ERROR: StationLogos is empty!"
+            exit 1
+          }
+
+          test -n "$(find plugins/LiveMap -type f -print -quit)" || {
+            echo "ERROR: LiveMap is empty!"
+            exit 1
+          }
 
       - name: Commit changes
         run: |
