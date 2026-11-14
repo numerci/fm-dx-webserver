@@ -1,5 +1,5 @@
 
-name: Sync Station Logos Plugins
+name: Sync GitHub Plugins
 
 on:
   schedule:
@@ -17,19 +17,39 @@ jobs:
       - name: Checkout destination
         uses: actions/checkout@v4
 
-      - name: Download source repository
+      - name: Clone station logos
         run: |
           git clone --depth 1 \
             https://github.com/Highpoint2000/webserver-station-logos.git \
             /tmp/station-logos
 
-      - name: Sync files
+      - name: Clone LiveMap
+        run: |
+          git clone --depth 1 \
+            https://github.com/Highpoint2000/LiveMap.git \
+            /tmp/LiveMap
+
+      - name: Sync station logos
         run: |
           mkdir -p plugins
+
           rsync -av --delete \
+            --exclude='/.git/' \
             --exclude='/README.md' \
             --exclude='/LICENSE' \
+            --exclude='/LiveMap/' \
             /tmp/station-logos/ plugins/
+
+      - name: Sync LiveMap
+        run: |
+          mkdir -p plugins/LiveMap
+
+          rsync -av --delete \
+            --exclude='/.git/' \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            --exclude='/LiveMapQuickGuide.pdf' \
+            /tmp/LiveMap/ plugins/LiveMap/
 
       - name: Commit changes
         run: |
@@ -39,7 +59,7 @@ jobs:
           git add plugins/
 
           if ! git diff --cached --quiet; then
-            git commit -m "Auto-sync station logos plugins"
+            git commit -m "Auto-sync GitHub plugins"
             git push
           else
             echo "No changes to synchronize"
