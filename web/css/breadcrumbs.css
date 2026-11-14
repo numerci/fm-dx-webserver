@@ -39,7 +39,7 @@ h2 {
     color: var(--color-4);
     margin-bottom: 0;
     margin-top: 8px;
-    font-weight: 500;
+    //font-weight: 500; //keep the font as it was
 }
 
 h3 {
