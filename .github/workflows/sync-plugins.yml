@@ -1,0 +1,46 @@
+
+name: Sync Station Logos Plugins
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout destination
+        uses: actions/checkout@v4
+
+      - name: Download source repository
+        run: |
+          git clone --depth 1 \
+            https://github.com/Highpoint2000/webserver-station-logos.git \
+            /tmp/station-logos
+
+      - name: Sync files
+        run: |
+          mkdir -p plugins
+          rsync -av --delete \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            /tmp/station-logos/ plugins/
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add plugins/
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-sync station logos plugins"
+            git push
+          else
+            echo "No changes to synchronize"
+          fi
