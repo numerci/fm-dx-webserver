@@ -86,7 +86,7 @@ label {
 
 .canvas-container {
     width: calc(100% - 20px);
-    height: 140px;
+    height: 175px;
     overflow: hidden;
     border-radius: 15px;
     margin-left: 10px;
