@@ -469,9 +469,9 @@ function initCanvas() {
                     grid: { display: false, borderWidth: 0, borderColor: "transparent" },
                     realtime: {
                         duration: 30000,
-                        refresh: 75,
+                        refresh: 275,
                         delay: 150,
-                        frameRate: 30, // default is 30
+                        frameRate: 15, // default is 30
                         onRefresh: (chart) => {
                             if (!chart?.data?.datasets || parsedData?.sig === undefined) return;
                             if ((isAndroid || isIOS || isIPadOS) && (document.hidden || !document.hasFocus())) return;
