@@ -14,42 +14,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Get destination repository
       - name: Checkout destination
         uses: actions/checkout@v4
 
-      # Download Station Logos
       - name: Clone Station Logos
         run: |
           git clone --depth 1 \
             https://github.com/Highpoint2000/webserver-station-logos.git \
             /tmp/StationLogos
 
-      # Download LiveMap
       - name: Clone LiveMap
         run: |
           git clone --depth 1 \
             https://github.com/Highpoint2000/LiveMap.git \
             /tmp/LiveMap
 
-      # Create destination folders
-      - name: Create plugin folders
-        run: |
-          mkdir -p plugins/StationLogos
-          mkdir -p plugins/LiveMap
+      - name: Create plugins folder
+        run: mkdir -p plugins
 
-      # Synchronize Station Logos
-      - name: Sync Station Logos
+      - name: Copy Station Logos files
         run: |
           rsync -av \
             --exclude='/.git/' \
             --exclude='/README.md' \
             --exclude='/LICENSE' \
             /tmp/StationLogos/ \
-            plugins/StationLogos/
+            plugins/
 
-      # Synchronize LiveMap
-      - name: Sync LiveMap
+      - name: Copy LiveMap files
         run: |
           rsync -av \
             --exclude='/.git/' \
@@ -57,34 +49,21 @@ jobs:
             --exclude='/LICENSE' \
             --exclude='/LiveMapQuickGuide.pdf' \
             /tmp/LiveMap/ \
-            plugins/LiveMap/
+            plugins/
 
-      # Verify downloaded files
-      - name: Verify plugins
+      - name: Verify files
         run: |
-          echo "===== STATION LOGOS ====="
-          find plugins/StationLogos -type f
+          echo "===== PLUGINS ====="
+          find plugins -type f
 
-          echo "===== LIVEMAP ====="
-          find plugins/LiveMap -type f
+          test -n "$(find plugins -type f ! -name '.gitkeep' -print -quit)" || exit 1
 
-          echo "Station Logos file count:"
-          find plugins/StationLogos -type f | wc -l
-
-          echo "LiveMap file count:"
-          find plugins/LiveMap -type f | wc -l
-
-          test -n "$(find plugins/StationLogos -type f -print -quit)" || exit 1
-          test -n "$(find plugins/LiveMap -type f -print -quit)" || exit 1
-
-      # Force Git to add ignored plugin files
       - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -f plugins/StationLogos/
-          git add -f plugins/LiveMap/
+          git add -f plugins/
 
           if ! git diff --cached --quiet; then
             git commit -m "Auto-sync GitHub plugins"
