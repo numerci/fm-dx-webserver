@@ -1,0 +1,2647 @@
+/*
+    Spectrum Graph v1.5.1 by AAD
+    https://github.com/AmateurAudioDude/FM-DX-Webserver-Plugin-Spectrum-Graph
+
+    //// Server-side code ////
+*/
+
+'use strict';
+
+const pluginVersion = '1.5.1';
+
+const AUTO_RESTART_ON_CONNECTION_ERROR = true;
+const FORCE_FALLBACK = false;
+const XDR_SENDS_HZ_FORM = true; // XDR tuners also receive 'Sw' from XDR-GTK, set false to send only 'Sf'
+const CHECK_FOR_UPDATES = true;
+
+const pluginName = "Spectrum Graph";
+const pluginHomepageUrl = "https://github.com/AmateurAudioDude/FM-DX-Webserver-Plugin-Spectrum-Graph";
+const pluginUpdateUrl = "https://raw.githubusercontent.com/AmateurAudioDude/FM-DX-Webserver-Plugin-Spectrum-Graph/refs/heads/main/SpectrumGraph/pluginSpectrumGraph.js";
+
+const debug = false;
+
+// Library imports
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+
+// Define paths used for file imports and config
+const rootDir = path.dirname(require.main.filename); // Locate directory where index.js is located
+const configFolderPath = path.join(rootDir, 'plugins_configs');
+const configFilePath = path.join(configFolderPath, 'SpectrumGraph.json');
+
+// File imports
+const config = require(rootDir + '/config.json');
+const { logInfo, logWarn, logError } = require(rootDir + '/server/console');
+const datahandlerReceived = require(rootDir + '/server/datahandler'); // To grab signal strength data
+const endpointsRouter = require(rootDir + '/server/endpoints');
+
+// Compatibility detection for hooks
+let pluginsApi = null;
+let wss, pluginsWss, serverConfig;
+let sendPrivilegedCommand;
+let useHooks = false;
+let usePrivileged = false;
+let isInternalScan = false; // fallback
+let emitPluginEvent = () => {};
+
+// Fallback WebSocket send
+sendPrivilegedCommand = async (command) => {
+    if (textSocket && textSocket.readyState === WebSocket.OPEN) {
+        textSocket.send(command);
+        return true;
+    }
+    logError(`${pluginName}: No WebSocket for fallback send: ${command}`);
+    return false;
+};
+
+try {
+    pluginsApi = require(rootDir + '/server/plugins_api');
+
+    if (pluginsApi?.emitPluginEvent) {
+        emitPluginEvent = pluginsApi.emitPluginEvent;
+    }
+
+    wss = pluginsApi.getWss?.();
+    pluginsWss = pluginsApi.getPluginsWss?.();
+    serverConfig = pluginsApi.getServerConfig?.();
+
+    if (pluginsApi.sendPrivilegedCommand) {
+        sendPrivilegedCommand = pluginsApi.sendPrivilegedCommand;
+    }
+
+    useHooks = !!(wss && pluginsWss);
+    usePrivileged = !!sendPrivilegedCommand && useHooks;
+
+    if (FORCE_FALLBACK) {
+        useHooks = false;
+        usePrivileged = false;
+    }
+
+    if (useHooks && usePrivileged) {
+        logInfo(`[${pluginName}] Using plugins_api with WebSocket hooks enabled`);
+
+        // Listen for spectrum scan requests from other plugins
+        // and trigger a local scan when received
+        pluginsApi.onPluginEvent('spectrum-graph', (msg) => {
+            if (msg?.value?.status === 'scan') {
+                isInternalScan = true;
+                ipAddress = '127.0.0.1';
+
+                clearTimeout(ipTimeout);
+                ipTimeout = setTimeout(() => {
+                    ipAddress = externalWsUrl;
+                }, 5000);
+
+                restartScan('scan');
+            }
+        });
+
+    } else {
+        logWarn(`[${pluginName}] Loaded plugins_api but hooks unavailable, using fallback mode`);
+        useHooks = false;
+        usePrivileged = false;
+
+        // Fallback WebSocket send
+        sendPrivilegedCommand = async (command) => {
+            if (textSocket && textSocket.readyState === WebSocket.OPEN) {
+                textSocket.send(command);
+                return true;
+            }
+            logError(`[${pluginName}] No WebSocket for fallback send: ${command}`);
+            return false;
+        };
+    }
+} catch (err) {
+    if (err.code === 'MODULE_NOT_FOUND') {
+        logWarn(`[${pluginName}] Missing plugins_api, using fallback mode, update FM-DX Webserver`);
+    } else {
+        throw err;
+    }
+
+    useHooks = false;
+    usePrivileged = false;
+}
+
+// const variables
+const validScans = ['scan', 'scan-0', 'scan-1', 'scan-2'];
+const VALID_SWEEP_LINES = ['none', 'line', 'line-dot', 'dot', 'glow'];
+const webserverPort = config.webserver.webserverPort || 8080;
+const externalWsUrl = `ws://127.0.0.1:${webserverPort}`;  // Used for fallback IP, but not for connections
+
+// let variables
+let extraSocket, textSocket, textSocketLost, messageParsed, messageParsedTimeout, debounceTimer, ipTimeout, intervalSerial, intervalSerialReconnect, serialConnectionLoss;
+let restartCounter = 0;
+let disableScanBelowFmLowerLimit = false;
+let ipAddress = externalWsUrl;
+let currentFrequency = 0;
+let initialDelay = 0;
+let lastRestartTime = 0;
+let nowTime = Date.now();
+let isFirstRun = true;
+let isScanRunning = false;
+let hasLoggedUndefined = false;
+let scanStatus = { scanStatus: "normal" };
+let formattedCustomRanges = [];
+let lastScanCommand = null;
+let connectionStatusKnown = false;
+let isDeviceCompatible = false;
+let sigArray = [];
+let progressiveSingleBurstScans = 0; // Consecutive scans that arrived in one chunk, so nothing could be streamed
+let cachedUpdateCheck = null;
+let scanSequence = '';
+
+// Check if module or radio firmware
+let isModule = true; // TEF668X module
+let isFirmwareDetected = false; // Until a 'U' response arrives, isModule is a guess
+let isFirstFirmwareNotice = false;
+let firmwareType = 'unknown';
+
+// Check device name in config
+let deviceName;
+let deviceConfig = config?.device || 'tef';
+
+if (deviceConfig === 'tef') {
+    deviceName = 'TEF668X';
+    isDeviceCompatible = true;
+} else if (deviceConfig === 'xdr') {
+    deviceName = 'XDR';
+    isDeviceCompatible = true;
+    isModule = false; // Declared XDR
+    firmwareType = 'XDR';
+} else if (deviceConfig === 'sdr') {
+    deviceName = 'SDR';
+} else if (deviceConfig === 'si47xx') {
+    deviceName = 'Si47XX';
+} else if (deviceConfig === 'other') {
+    deviceName = 'RX device';
+} else {
+    deviceName = 'TEF668X';
+    isDeviceCompatible = true;
+}
+
+// Si47XX keeps the limited compatibility notice but has a known filter table
+const hasFilterTable = isDeviceCompatible || deviceConfig === 'si47xx';
+
+const hfUpperLimit = deviceConfig === 'si47xx' ? 30 : 27; // MHz
+
+// Normalise IP address
+function normalizeIp(ip) {
+    return ip
+        ?.replace(/^::ffff:/, '')
+        .trim();
+}
+
+// Function to create custom router
+let spectrumData = {
+    sd: null,
+    isFirstRun // Prevent undefined before the startup sequence sets it
+};
+
+const UPDATE_CHECK_TTL = 6 * 60 * 60 * 1000;
+
+// Only ever called when an admin opens the settings page, so there is no background polling
+async function getLatestVersion() {
+    if (cachedUpdateCheck && Date.now() - cachedUpdateCheck.checkedAt < UPDATE_CHECK_TTL) return cachedUpdateCheck.latest;
+
+    let latest = null;
+    try {
+        const response = await fetch(pluginUpdateUrl, { signal: AbortSignal.timeout(8000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const match = (await response.text()).match(/const\s+plugin[_vV]ersion\s*=\s*['"]([^'"]+)['"]/);
+        if (match) latest = match[1];
+    } catch (error) {
+        logWarn(`[${pluginName}] Update check failed: ${error.message}`);
+    }
+
+    cachedUpdateCheck = { latest, checkedAt: Date.now() };
+    return latest;
+}
+
+// Problems the console warns about, surfaced where an admin will actually see them
+function progressiveScanIssue() {
+    if (!progressiveScanEnabled) return null;
+
+    if (!progressiveScanAvailable) {
+        return `No raw serial data hook is available, so Progressive Scan cannot run. Update FM-DX Webserver to a version including <b>plugins_api.onRawSerialData</b>.`;
+    }
+
+    if (progressiveSingleBurstScans > 0) {
+        const scans = progressiveSingleBurstScans === 1 ? `The last scan` : `The last ${progressiveSingleBurstScans} scans`;
+        return `${scans} arrived as a single burst, so there was nothing to reveal progressively. This usually means xdrd is not the forked build that streams scan data. Follow the setup instructions on the <a href="${pluginHomepageUrl}#progressive-scan" target="_blank" rel="noopener">GitHub page</a>, or turn off Progressive Scan below.`;
+    }
+
+    return null;
+}
+
+const checkStrictAdmin = (req, res, next) => {
+    if (req.session && req.session.isAdminAuthenticated) return next();
+    return res.status(401).send('Unauthorised.');
+};
+
+function customRouter() {
+    endpointsRouter.get('/spectrum-graph-plugin/api/config', (req, res) => {
+        const isAdmin = (req.session && req.session.isAdminAuthenticated) || false;
+        const response = { isAdmin, config: { fmLowerLimit, progressiveScanEnabled, progressiveScanSweepLine, ...clientSettings } };
+        if (isAdmin) {
+            response.config = {
+                ...clientSettings,
+                fmLowerLimit,
+                rescanDelay,
+                tuningRange,
+                tuningStepSize,
+                tuningBandwidth,
+                customRanges,
+                disableHfSpanLimit,
+                disableHfScanning,
+                sendBothBandwidthCommands,
+                warnIncompleteData,
+                logLocalCommands,
+                clearGraphOnScan,
+                progressiveScanEnabled,
+                progressiveScanSweepLine,
+                progressiveScanBatchMs,
+                progressiveScanReferenceClients,
+                definedBands,
+            };
+        }
+        res.json(response);
+    });
+
+    endpointsRouter.post('/spectrum-graph-plugin/api/config', checkStrictAdmin, express.json(), (req, res) => {
+        // JSON only prevents a submission using admin's cookie
+        if (!req.is('application/json')) return res.status(415).json({ success: false });
+
+        try {
+            const body = req.body;
+            const updated = {
+                rescanDelay:        !isNaN(Number(body.rescanDelay))        ? Number(body.rescanDelay)        : rescanDelay,
+                tuningRange:        !isNaN(Number(body.tuningRange))        ? Number(body.tuningRange)        : tuningRange,
+                tuningStepSize:     !isNaN(Number(body.tuningStepSize))     ? Number(body.tuningStepSize)     : tuningStepSize,
+                tuningBandwidth:    !isNaN(Number(body.tuningBandwidth))    ? Number(body.tuningBandwidth)    : tuningBandwidth,
+                fmLowerLimit:       !isNaN(Number(body.fmLowerLimit))       ? Number(body.fmLowerLimit)       : fmLowerLimit,
+                customRanges:       typeof body.customRanges === 'string'   ? body.customRanges               : customRanges,
+                disableHfSpanLimit: typeof body.disableHfSpanLimit === 'boolean' ? body.disableHfSpanLimit    : disableHfSpanLimit,
+                disableHfScanning:  typeof body.disableHfScanning === 'boolean'  ? body.disableHfScanning     : disableHfScanning,
+                sendBothBandwidthCommands: typeof body.sendBothBandwidthCommands === 'boolean' ? body.sendBothBandwidthCommands : sendBothBandwidthCommands,
+                warnIncompleteData: typeof body.warnIncompleteData === 'boolean' ? body.warnIncompleteData    : warnIncompleteData,
+                logLocalCommands:   typeof body.logLocalCommands === 'boolean'   ? body.logLocalCommands      : logLocalCommands,
+                clearGraphOnScan:   typeof body.clearGraphOnScan === 'boolean'   ? body.clearGraphOnScan      : clearGraphOnScan,
+                progressiveScanEnabled:   typeof body.progressiveScanEnabled === 'boolean' ? body.progressiveScanEnabled : progressiveScanEnabled,
+                progressiveScanSweepLine: VALID_SWEEP_LINES.includes(body.progressiveScanSweepLine) ? body.progressiveScanSweepLine : progressiveScanSweepLine,
+                progressiveScanBatchMs:   !isNaN(Number(body.progressiveScanBatchMs)) ? Math.min(2000, Math.max(20, Number(body.progressiveScanBatchMs))) : progressiveScanBatchMs,
+                progressiveScanReferenceClients: !isNaN(Number(body.progressiveScanReferenceClients)) ? Math.min(100, Math.max(1, Number(body.progressiveScanReferenceClients))) : progressiveScanReferenceClients,
+                definedBands:       Array.isArray(body.definedBands) && body.definedBands.length > 0 &&
+                                    body.definedBands.every(b => b && typeof b.name === 'string' &&
+                                        Number.isFinite(b.start) && Number.isFinite(b.end) &&
+                                        Number.isFinite(b.step) && Number.isFinite(b.bw))
+                                        ? body.definedBands : definedBands,
+            };
+            CLIENT_SETTINGS.forEach(s => {
+                updated[s.key] = (s.key in body) ? coerceClientSetting(s, body[s.key]) : clientSettings[s.key];
+            });
+            suppressNextFileWatchReload = true;
+            saveUpdatedConfig(updated);
+            loadConfigFile('re');
+            res.json({ success: true });
+        } catch (err) {
+            logError(`[${pluginName}] Error saving config via API: ${err.message}`);
+            res.status(500).json({ success: false });
+        }
+    });
+
+    endpointsRouter.get('/spectrum-graph-plugin/settings', checkStrictAdmin, async (req, res) => {
+        const latestVersion = CHECK_FOR_UPDATES ? await getLatestVersion() : null;
+        const cfg = {
+            ...clientSettings,
+            rescanDelay, tuningRange, tuningStepSize, tuningBandwidth,
+            fmLowerLimit, customRanges, disableHfSpanLimit, disableHfScanning, sendBothBandwidthCommands, warnIncompleteData, logLocalCommands, clearGraphOnScan,
+            progressiveScanEnabled, progressiveScanSweepLine, progressiveScanBatchMs, progressiveScanReferenceClients,
+            definedBands,
+            tuningUpperLimit: (config?.webserver?.tuningLimit === false ? 108 : Number(config?.webserver?.tuningUpperLimit)) || 108,
+        };
+
+        // Only the device's own widths are listed
+        const fmWidths = deviceConfig === 'si47xx' ? SI47XX_WIDTHS : Object.keys(deviceConfig === 'xdr' ? FILTER_INDEX_XDR : FILTER_INDEX_TEF)
+            .map(Number).sort((a, b) => a - b);
+        const amWidths = deviceConfig === 'si47xx' ? SI47XX_AM_WIDTHS : TEF_AM_WIDTHS;
+        const edgeLabel = (list, i, narrow, wide) => i === 0 ? ` ${narrow}` : i === list.length - 1 ? ` ${wide}` : '';
+
+        const bwOptions = [
+            ...fmWidths.map((w, i) => ({ val: w, label: `${w} kHz${edgeLabel(fmWidths, i, '(FM narrow)', '(FM wide)')}` })),
+            ...amWidths.map((w, i) => ({ val: w, label: `AM ${w} kHz${edgeLabel(amWidths, i, '(narrow)', '(wide)')}` })),
+        ];
+
+        const bwOptionsHtml = bwOptions.map(o => `<option value="${o.val}">${o.label}</option>`).join('');
+
+        const bandsJson = JSON.stringify(cfg.definedBands);
+
+        const supportedBandwidths = fmWidths.join(', ');
+
+        const scanIssue = progressiveScanIssue();
+        const isUpdateAvailable = latestVersion && latestVersion !== pluginVersion;
+
+        const bannersHtml = [
+            scanIssue ? `<div class="banner banner-warn"><span class="banner-icon">&#9888;</span><div><b>Progressive Scan</b><br>${scanIssue}</div></div>` : '',
+            isUpdateAvailable ? `<div class="banner banner-info"><span class="banner-icon">&#8679;</span><div>Spectrum Graph <b>v${latestVersion}</b> is available, this server is running v${pluginVersion}. See the <a href="${pluginHomepageUrl}" target="_blank" rel="noopener">GitHub page</a>.</div></div>` : '',
+        ].join('');
+
+        const clientFieldsHtml = (section) => CLIENT_SETTINGS.filter(s => s.section === section).map(s => {
+            const control = s.type === 'boolean'
+                ? `<label class="toggle"><input type="checkbox" id="${s.key}" ${cfg[s.key] ? 'checked' : ''}><span class="toggle-track"></span></label>`
+                : s.type === 'number'
+                    ? `<input type="number" id="${s.key}" value="${cfg[s.key]}" min="${s.min}" max="${s.max}" step="${s.step}">`
+                    : `<input type="text" id="${s.key}" value="${String(cfg[s.key]).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}">`;
+            return `            <div class="field-row">
+                <div><div class="field-label">${s.label}</div><div class="field-hint">${s.hint}</div></div>
+                <div class="field-control">${control}</div>
+            </div>`;
+        }).join('\n');
+
+        const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spectrum Graph - Settings</title>
+    <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #0f0f0f;
+            --surface: #181818;
+            --surface2: #202020;
+            --border: #2a2a2a;
+            --border-hover: #444;
+            --text: #e8e8e8;
+            --muted: #666;
+            --accent: #2ec4b6;
+            --accent-dim: rgba(46,196,182,0.12);
+            --accent-hover: #25a99e;
+            --danger: #c0392b;
+            --danger-dim: rgba(192,57,43,0.12);
+            --success: #1e8c6e;
+        }
+        body { font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+        header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 32px; display: flex; align-items: center; justify-content: space-between; height: 56px; flex-shrink: 0; }
+        .header-title { font-size: 15px; font-weight: 600; letter-spacing: 0.04em; color: var(--accent); display: flex; align-items: center; gap: 10px; }
+        .header-title svg { opacity: 0.85; }
+        .btn-save { background: var(--accent); color: #0f0f0f; border: none; padding: 8px 22px; border-radius: 4px; font-size: 13px; font-weight: 700; cursor: pointer; letter-spacing: 0.03em; transition: background 0.15s; }
+        .btn-save:hover { background: var(--accent-hover); }
+        .btn-save:disabled { opacity: 0.5; cursor: default; }
+        .btn-reset { background: none; color: var(--muted); border: 1px solid var(--border); padding: 8px 16px; border-radius: 4px; font-size: 13px; cursor: pointer; letter-spacing: 0.03em; transition: color 0.15s, border-color 0.15s; }
+        .btn-reset:hover { color: var(--danger); border-color: var(--danger); }
+        nav { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 32px; display: flex; gap: 0; flex-shrink: 0; }
+        .tab-btn { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 12px 18px; font-size: 13px; cursor: pointer; transition: color 0.15s, border-color 0.15s; letter-spacing: 0.02em; }
+        .tab-btn:hover { color: var(--text); }
+        .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+        main { flex: 1; padding: 28px 32px; overflow-y: auto; }
+        .tab-content { display: none; max-width: 780px; }
+        .tab-content.active { display: block; }
+        .section-label { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+        .field-group { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 24px; }
+        .field-row { display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; border-bottom: 1px solid var(--border); gap: 16px; }
+        .field-row:last-child { border-bottom: none; }
+        .field-row:hover { background: var(--surface2); }
+        .field-label { font-size: 13px; font-weight: 500; }
+        .field-hint { font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 1.5; }
+        .field-control { flex-shrink: 0; }
+        input[type=number], input[type=text], select {
+            background: var(--bg); border: 1px solid var(--border); color: var(--text);
+            padding: 6px 10px; border-radius: 4px; font-size: 13px; outline: none;
+            transition: border-color 0.15s; width: 110px;
+        }
+        input[type=number]:focus, input[type=text]:focus, select:focus { border-color: var(--accent); }
+        select { width: auto; min-width: 110px; }
+        textarea {
+            background: var(--bg); border: 1px solid var(--border); color: var(--text);
+            padding: 8px 10px; border-radius: 4px; font-size: 12px; font-family: monospace;
+            outline: none; transition: border-color 0.15s; width: 100%; resize: vertical; min-height: 72px;
+        }
+        textarea:focus { border-color: var(--accent); }
+        .toggle { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-track { position: absolute; inset: 0; background: #333; border-radius: 22px; cursor: pointer; transition: background 0.2s; }
+        .toggle-track::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #888; border-radius: 50%; transition: transform 0.2s, background 0.2s; }
+        .toggle input:checked + .toggle-track { background: var(--accent-dim); }
+        .toggle input:checked + .toggle-track::before { transform: translateX(18px); background: var(--accent); }
+        /* Ranges tab */
+        .ranges-hint { font-size: 12px; color: var(--muted); line-height: 1.6; padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 16px; }
+        .ranges-hint code { color: var(--accent); font-family: monospace; font-size: 11px; }
+        /* Bands table */
+        .bands-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        thead th { background: var(--surface2); color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+        tbody tr { border-bottom: 1px solid var(--border); }
+        tbody tr:last-child { border-bottom: none; }
+        tbody tr:hover td { background: var(--surface2); }
+        td { padding: 5px 6px; }
+        .band-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 7px; border-radius: 3px; font-size: 12px; width: 100%; outline: none; }
+        .band-input:focus { border-color: var(--accent); }
+        .band-input.nm { width: 62px; }
+        .btn-del { background: none; border: 1px solid transparent; color: var(--muted); border-radius: 3px; padding: 3px 8px; cursor: pointer; font-size: 11px; transition: all 0.15s; }
+        .btn-del:hover { border-color: var(--danger); color: var(--danger); background: var(--danger-dim); }
+        .btn-add { background: none; border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; padding: 7px 14px; cursor: pointer; font-size: 12px; font-weight: 600; transition: background 0.15s; }
+        .btn-add:hover { background: var(--accent-dim); }
+        .est { font-size: 12px; white-space: nowrap; }
+        .est-ok { color: var(--success); }
+        .est-slow { color: var(--danger); font-weight: 600; }
+        .est-none { color: var(--muted); }
+        .btn-add:disabled { opacity: 0.4; cursor: default; }
+        .btn-add:disabled:hover { background: none; }
+        /* Banners */
+        .banner { display: flex; gap: 10px; align-items: flex-start; padding: 12px 32px; font-size: 13px; line-height: 1.55; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+        .banner b { font-weight: 600; }
+        .banner a { color: inherit; text-decoration: underline; }
+        .banner-icon { font-size: 15px; line-height: 1.3; flex-shrink: 0; }
+        .banner-warn { background: var(--danger-dim); color: #e8928a; }
+        .banner-info { background: var(--accent-dim); color: var(--accent); }
+        /* Toast */
+        #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--success); color: #fff; padding: 10px 20px; border-radius: 4px; font-size: 13px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.25s; z-index: 99; }
+        #toast.err { background: var(--danger); }
+        #toast.show { opacity: 1; }
+    </style>
+</head>
+<body>
+<header>
+    <div class="header-title">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Spectrum Graph v${pluginVersion} - Settings
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn-reset" id="resetBtn">Reset to Defaults</button>
+        <button class="btn-save" id="saveBtn">Save Settings</button>
+    </div>
+</header>
+<nav>
+    <button class="tab-btn active" data-target="tab-general">General</button>
+    <button class="tab-btn" data-target="tab-ranges">Custom Ranges</button>
+    <button class="tab-btn" data-target="tab-bands">Band Definitions</button>
+    <button class="tab-btn" data-target="tab-display">Display</button>
+</nav>
+${bannersHtml}
+<main>
+    <div id="tab-general" class="tab-content active">
+        <div class="section-label" style="margin-top:4px">Scanning</div>
+        <div class="field-group">
+            <div class="field-row">
+                <div><div class="field-label">Rescan Delay</div><div class="field-hint">Number of seconds elapsed since the previous scan before a new scan can be initiated. Set to 0 to disable.<br>Caution: Lowering the value increases the risk of your server being overloaded with scan requests.</div></div>
+                <div class="field-control"><input type="number" id="rescanDelay" value="${cfg.rescanDelay}" min="0" step="1"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Tuning Range</div><div class="field-hint">Scan radius in MHz around current frequency. Set to 0 for full band scan.</div></div>
+                <div class="field-control"><input type="number" id="tuningRange" value="${cfg.tuningRange}" min="0" step="0.1"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">FM Step Size</div><div class="field-hint">Tuning step size, in kHz. Recommended values are either 50 or 100.${deviceConfig === 'si47xx' ? `<br>${deviceName} tunes FM in 10 kHz increments.` : ''}</div></div>
+                <div class="field-control"><input type="number" id="tuningStepSize" value="${cfg.tuningStepSize}" min="1" step="1"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">FM Bandwidth</div><div class="field-hint">Filter bandwidth for FM scans in kHz. Set to 0 for the tuner's automatic bandwidth.${hasFilterTable ? `<br>Supported values for ${deviceName}: ${supportedBandwidths}.` : ''}</div></div>
+                <div class="field-control"><input type="number" id="tuningBandwidth" value="${cfg.tuningBandwidth}" min="0" step="1"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">FM Lower Limit</div><div class="field-hint">Lower edge of the FM band in MHz to scan. Default value is 86.</div></div>
+                <div class="field-control"><input type="number" id="fmLowerLimit" value="${cfg.fmLowerLimit}" min="64" max="108" step="0.1"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Send Both Bandwidth Commands</div><div class="field-hint">Sends the bandwidth as both an index (<b>Sf</b>) and in Hz (<b>Sw</b>) when a scan starts, instead of whichever one suits the detected firmware.<br>Enable only if your tuner ignores the bandwidth during scans.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="sendBothBandwidthCommands" ${cfg.sendBothBandwidthCommands ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Disable HF Scanning</div><div class="field-hint">Blocks scans below 30 MHz, including LW, MW, SW and custom HF ranges.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="disableHfScanning" ${cfg.disableHfScanning ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Estimated Scan Time</div><div class="field-hint">For the main Scan button, using the tuner's upper limit of ${cfg.tuningUpperLimit} MHz.<br>A full band scan covers the FM band or the range below it, depending on where the radio is currently tuned.</div></div>
+                <div class="field-control"><div id="mainScanEst" class="est"></div></div>
+            </div>
+        </div>
+        <div class="section-label">Progressive Scan</div>
+        <div class="field-group">
+            <div class="field-row">
+                <div><div class="field-label">Enable Progressive Scan</div><div class="field-hint">Fill in the graph live as the scan sweeps the band, instead of waiting for it to finish.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="progressiveScanEnabled" ${cfg.progressiveScanEnabled ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Sweep Line</div><div class="field-hint">Marks where the scan is currently up to.</div></div>
+                <div class="field-control">
+                    <select id="progressiveScanSweepLine">
+                        <option value="none"${cfg.progressiveScanSweepLine === 'none' ? ' selected' : ''}>None</option>
+                        <option value="line"${cfg.progressiveScanSweepLine === 'line' ? ' selected' : ''}>Line</option>
+                        <option value="line-dot"${cfg.progressiveScanSweepLine === 'line-dot' ? ' selected' : ''}>Line + Dot</option>
+                        <option value="dot"${cfg.progressiveScanSweepLine === 'dot' ? ' selected' : ''}>Dot</option>
+                        <option value="glow"${cfg.progressiveScanSweepLine === 'glow' ? ' selected' : ''}>Glow</option>
+                    </select>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Batch Interval</div><div class="field-hint">How often (ms) newly-scanned points are sent to clients. Lower uses more CPU per connected client but is closer to real-time, higher is lighter on CPU but delays the sweep further behind.</div></div>
+                <div class="field-control"><input type="number" id="progressiveScanBatchMs" value="${cfg.progressiveScanBatchMs}" min="20" max="2000" step="10"></div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Reference Connection Count</div><div class="field-hint">Batch Interval above is calibrated for up to this many open <b>/data_plugins</b> connections. Beyond it, the interval stretches proportionally so total server load stays roughly flat rather than growing with each one. Note: <b>/data_plugins</b> is shared across plugins, so one browser tab can open several connections to it - open a tab and check your server logs/network console to see the actual number before tuning this.</div></div>
+                <div class="field-control"><input type="number" id="progressiveScanReferenceClients" value="${cfg.progressiveScanReferenceClients}" min="1" max="100" step="1"></div>
+            </div>
+        </div>
+        <div class="section-label">Diagnostics</div>
+        <div class="field-group">
+            <div class="field-row">
+                <div><div class="field-label">Warn Incomplete Data</div><div class="field-hint">Enable to display console warnings about incomplete/interrupted scans.<br>Note: Some firmware outputs data that always appears to be incomplete.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="warnIncompleteData" ${cfg.warnIncompleteData ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Log Local Commands</div><div class="field-hint">Disable to hide commands shown in console that have been sent locally, such as from another plugin.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="logLocalCommands" ${cfg.logLocalCommands ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+            <div class="field-row">
+                <div><div class="field-label">Clear Graph Data on Scan</div><div class="field-hint">Clear the spectrum graph data when a new scan begins.<br>Note: This clears graph data, not the graph canvas.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="clearGraphOnScan" ${cfg.clearGraphOnScan ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="tab-ranges" class="tab-content">
+        <div class="ranges-hint" style="margin-top:4px">
+            <strong>Format:</strong> <code>count, Name, lowMHz, highMHz[, stepKHz], ...</code><br>
+            <strong>Example:</strong> <code>2, FM1, 65, 74, 50, FM2, 80, 88, 50</code><br>
+            Configure up to two custom frequency range buttons. The per-range step (kHz) is optional. An FM button is always prepended automatically.<br>
+            The table and the string stay in sync, the string is what gets saved. Edits to the string apply when you click away from it.
+        </div>
+        <div class="section-label">Ranges</div>
+        <div class="bands-wrap">
+            <table>
+                <thead><tr><th>Name</th><th>Low (MHz)</th><th>High (MHz)</th><th>Step (kHz)</th><th>Est. Time</th><th></th></tr></thead>
+                <tbody id="rangesBody"></tbody>
+            </table>
+        </div>
+        <button class="btn-add" id="addRangeBtn">+ Add Range</button>
+        <div class="section-label" style="margin-top:20px">Limits</div>
+        <div class="field-group">
+            <div class="field-row">
+                <div><div class="field-label">Disable 3 MHz HF Span Limit</div><div class="field-hint">Custom ranges starting below 30 MHz are normally capped to a 3 MHz span. Disable to allow wider HF scans.<br>Watch the scan duration: clients drop the connection after 5 seconds, and HF defaults to 1-2 kHz steps, so set a coarser per-range step for wide spans.</div></div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" id="disableHfSpanLimit" ${cfg.disableHfSpanLimit ? 'checked' : ''}><span class="toggle-track"></span></label>
+                </div>
+            </div>
+        </div>
+        <div class="section-label" style="margin-top:20px">Ranges String</div>
+        <div class="field-group" style="padding:14px 16px">
+            <textarea id="customRanges" rows="4" spellcheck="false">${cfg.customRanges.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</textarea>
+        </div>
+    </div>
+
+    <div id="tab-bands" class="tab-content">
+        <p style="font-size:12px;color:var(--muted);margin:4px 0 16px">Matched by current frequency for AM/SW scans. All values in kHz. Bands &ge;64&nbsp;MHz use FM demodulator logic.</p>
+        <div class="bands-wrap">
+            <table>
+                <thead><tr><th>Name</th><th>Start (kHz)</th><th>End (kHz)</th><th>Step (kHz)</th><th>BW (kHz)</th><th>Est. Time</th><th></th></tr></thead>
+                <tbody id="bandsBody"></tbody>
+            </table>
+        </div>
+        <button class="btn-add" id="addBandBtn">+ Add Band</button>
+    </div>
+
+    <div id="tab-display" class="tab-content">
+        <p style="font-size:12px;color:var(--muted);margin:4px 0 16px">Applied in the browser. Connected clients pick these up on next page load. Not all client-side settings can be configured on this page, see <b>pluginSpectrumGraph.js</b> for for the remaining options, which are read as the plugin loads.</p>
+        <div class="section-label">Interface</div>
+        <div class="field-group">
+${clientFieldsHtml('interface')}
+        </div>
+        <div class="section-label">Advanced</div>
+        <div class="field-group">
+${clientFieldsHtml('advanced')}
+        </div>
+    </div>
+</main>
+<div id="toast"></div>
+<script>
+    const bwOptionsHtml = \`${bwOptionsHtml}\`;
+    let bands = ${bandsJson};
+    const DEFAULTS = ${JSON.stringify({ rescanDelay: defaultConfig.rescanDelay, tuningRange: defaultConfig.tuningRange, tuningStepSize: defaultConfig.tuningStepSize, tuningBandwidth: defaultConfig.tuningBandwidth, fmLowerLimit: defaultConfig.fmLowerLimit, customRanges: defaultConfig.customRanges, disableHfSpanLimit: defaultConfig.disableHfSpanLimit, disableHfScanning: defaultConfig.disableHfScanning, sendBothBandwidthCommands: defaultConfig.sendBothBandwidthCommands, warnIncompleteData: defaultConfig.warnIncompleteData, logLocalCommands: defaultConfig.logLocalCommands, clearGraphOnScan: defaultConfig.clearGraphOnScan, progressiveScanEnabled: defaultConfig.progressiveScanEnabled, progressiveScanSweepLine: defaultConfig.progressiveScanSweepLine, progressiveScanBatchMs: defaultConfig.progressiveScanBatchMs, progressiveScanReferenceClients: defaultConfig.progressiveScanReferenceClients, definedBands: defaultConfig.definedBands, ...Object.fromEntries(CLIENT_SETTINGS.map(s => [s.key, s.def])) })};
+    const CLIENT_FIELDS = ${JSON.stringify(CLIENT_SETTINGS.map(s => ({ key: s.key, type: s.type })))};
+
+    function renderBands() {
+        const tbody = document.getElementById('bandsBody');
+        tbody.innerHTML = '';
+        bands.forEach((band, i) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = \`
+                <td><input class="band-input nm" data-i="\${i}" data-field="name" value="\${escHtml(band.name)}"></td>
+                <td><input class="band-input" type="number" data-i="\${i}" data-field="start" value="\${band.start}"></td>
+                <td><input class="band-input" type="number" data-i="\${i}" data-field="end" value="\${band.end}"></td>
+                <td><input class="band-input" type="number" data-i="\${i}" data-field="step" value="\${band.step}"></td>
+                <td><select class="band-input" data-i="\${i}" data-field="bw">\${bwOptionsHtml}</select></td>
+                <td class="est" data-est="band" data-i="\${i}"></td>
+                <td><button class="btn-del" data-i="\${i}">Remove</button></td>
+            \`;
+            tbody.appendChild(tr);
+            const bwSelect = tr.querySelector('select[data-field="bw"]');
+            bwSelect.value = band.bw;
+            if (bwSelect.value !== String(band.bw)) {
+                bwSelect.insertAdjacentHTML('afterbegin', \`<option value="\${band.bw}">\${band.bw} kHz (unsupported)</option>\`);
+                bwSelect.value = band.bw;
+            }
+        });
+        tbody.querySelectorAll('input.band-input').forEach(el => {
+            el.addEventListener('input', () => {
+                const i = +el.dataset.i, f = el.dataset.field;
+                bands[i][f] = f === 'name' ? el.value : Number(el.value);
+                updateEstimates();
+            });
+        });
+        updateEstimates();
+        tbody.querySelectorAll('select.band-input').forEach(el => {
+            el.addEventListener('change', () => { bands[+el.dataset.i].bw = Number(el.value); });
+        });
+        tbody.querySelectorAll('.btn-del').forEach(el => {
+            el.addEventListener('click', () => { bands.splice(+el.dataset.i, 1); renderBands(); });
+        });
+    }
+
+    function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    document.getElementById('addBandBtn').addEventListener('click', () => {
+        bands.push({ name: 'New', start: 0, end: 0, step: 1, bw: 3 });
+        renderBands();
+    });
+
+    const MAX_RANGES = 2;
+    let ranges = parseRangesString(document.getElementById('customRanges').value);
+
+    // Stride mirrors the server parser, a 4th numeric field means that range carries a step
+    function parseRangesString(str) {
+        const parts = String(str).split(',').map(p => p.trim());
+        const count = Number(parts[0]) || 0;
+        const out = [];
+        let pos = 1;
+        for (let i = 0; i < count; i++) {
+            const name = parts[pos];
+            const low = Number(parts[pos + 1]);
+            const high = Number(parts[pos + 2]);
+            const maybeStep = parts[pos + 3];
+            const hasStep = maybeStep !== undefined && maybeStep !== '' && !isNaN(Number(maybeStep)) && Number(maybeStep) > 0;
+            if (name && !isNaN(low) && !isNaN(high)) out.push({ name, low, high, step: hasStep ? Number(maybeStep) : '' });
+            pos += hasStep ? 4 : 3;
+        }
+        return out.slice(0, MAX_RANGES);
+    }
+
+    function buildRangesString() {
+        const rows = ranges.filter(r => String(r.name).trim() !== '');
+        if (rows.length === 0) return '';
+        const parts = [rows.length];
+        rows.forEach(r => {
+            parts.push(String(r.name).trim(), Number(r.low) || 0, Number(r.high) || 0);
+            const step = Number(r.step);
+            if (String(r.step).trim() !== '' && step > 0) parts.push(step);
+        });
+        return parts.join(', ');
+    }
+
+    function syncRangesString() {
+        document.getElementById('customRanges').value = buildRangesString();
+    }
+
+    function renderRanges() {
+        const tbody = document.getElementById('rangesBody');
+        tbody.innerHTML = '';
+        ranges.forEach((r, i) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = \`
+                <td><input class="band-input nm" data-i="\${i}" data-field="name" value="\${escHtml(r.name)}"></td>
+                <td><input class="band-input" type="number" step="any" data-i="\${i}" data-field="low" value="\${r.low}"></td>
+                <td><input class="band-input" type="number" step="any" data-i="\${i}" data-field="high" value="\${r.high}"></td>
+                <td><input class="band-input" type="number" step="1" placeholder="auto" data-i="\${i}" data-field="step" value="\${r.step}"></td>
+                <td class="est" data-est="range" data-i="\${i}"></td>
+                <td><button class="btn-del" data-i="\${i}">Remove</button></td>
+            \`;
+            tbody.appendChild(tr);
+        });
+        tbody.querySelectorAll('input.band-input').forEach(el => {
+            el.addEventListener('input', () => {
+                const i = +el.dataset.i, f = el.dataset.field;
+                ranges[i][f] = (f === 'name' || el.value === '') ? el.value : Number(el.value);
+                syncRangesString();
+                updateEstimates();
+            });
+        });
+        updateEstimates();
+        tbody.querySelectorAll('.btn-del').forEach(el => {
+            el.addEventListener('click', () => { ranges.splice(+el.dataset.i, 1); renderRanges(); syncRangesString(); });
+        });
+        document.getElementById('addRangeBtn').disabled = ranges.length >= MAX_RANGES;
+    }
+
+    document.getElementById('addRangeBtn').addEventListener('click', () => {
+        if (ranges.length >= MAX_RANGES) return;
+        ranges.push({ name: 'New', low: 0, high: 0, step: '' });
+        renderRanges();
+        syncRangesString();
+    });
+
+    document.getElementById('customRanges').addEventListener('change', () => {
+        ranges = parseRangesString(document.getElementById('customRanges').value);
+        renderRanges();
+    });
+
+    const SCAN_WARN_SECONDS = 4.75;
+    const FM_POINT_MS = ${deviceConfig === 'si47xx' ? 9.5 : 6.2};
+    const HF_POINT_MS = ${deviceConfig === 'si47xx' ? 16.5 : 9.8};
+
+    // Calibrated against measured scans, biased to over-estimate so a borderline range reads as slow rather than safe
+    function estimateScanSeconds(lowMHz, highMHz, stepKHz) {
+        const spanKHz = (highMHz - lowMHz) * 1000;
+        if (!(spanKHz > 0) || !(stepKHz > 0)) return null;
+        const points = Math.floor(spanKHz / stepKHz) + 1;
+        const ms = lowMHz >= 64 ? 300 + points * FM_POINT_MS : 250 + points * HF_POINT_MS;
+        return Math.ceil(ms / 100) / 10;
+    }
+
+    // Mirrors the clamps startScan() applies before the tuner sees the range
+    function effectiveRangeBounds(r) {
+        let low = Number(r.low), high = Number(r.high);
+        if (low < 30) {
+            if (low < 0.144) low = 0.144;
+            if (high > ${hfUpperLimit}) high = ${hfUpperLimit};
+            if (!document.getElementById('disableHfSpanLimit').checked && high - low > 3) high = low + 3;
+        } else {
+            if (low < 64) low = 64;
+            if (high > 108) high = 108;
+        }
+        return { low, high };
+    }
+
+    function effectiveRangeStep(r, low, high) {
+        if (String(r.step).trim() !== '' && Number(r.step) > 0) return Number(r.step);
+        if (low < 30) return low <= 1.710 ? 1 : 2;
+        const fmLower = Number(document.getElementById('fmLowerLimit').value) || 86;
+        return high <= fmLower ? 30 : (Number(document.getElementById('tuningStepSize').value) || 50);
+    }
+
+    function paintEstimate(cell, seconds) {
+        if (seconds === null) {
+            cell.textContent = '—';
+            cell.className = 'est est-none';
+            return;
+        }
+        cell.textContent = seconds.toFixed(1) + 's';
+        cell.className = seconds >= SCAN_WARN_SECONDS ? 'est est-slow' : 'est est-ok';
+    }
+
+    const TUNING_UPPER_LIMIT = ${cfg.tuningUpperLimit};
+
+    // Main scan splits at the FM lower limit, so a full band scan is one segment or the other
+    function updateMainScanEstimate() {
+        const fmLower = Number(document.getElementById('fmLowerLimit').value) || 86;
+        const step = Number(document.getElementById('tuningStepSize').value) || 50;
+        const range = Number(document.getElementById('tuningRange').value) || 0;
+        const upper = TUNING_UPPER_LIMIT;
+
+        const segments = [];
+        if (range > 0) {
+            const span = Math.min(2 * range, upper - fmLower);
+            segments.push(['±' + range + ' MHz', estimateScanSeconds(fmLower, fmLower + span, step)]);
+        } else {
+            segments.push([fmLower + '-' + upper + ' MHz', estimateScanSeconds(fmLower, upper, step)]);
+            if (fmLower > 64) segments.push(['64-' + fmLower + ' MHz', estimateScanSeconds(64, fmLower, step)]);
+        }
+
+        document.getElementById('mainScanEst').innerHTML = segments.map(([label, sec]) => {
+            if (sec === null) return '<div class="est est-none">' + label + ': —</div>';
+            const cls = sec >= SCAN_WARN_SECONDS ? 'est est-slow' : 'est est-ok';
+            return '<div class="' + cls + '">' + label + ': ' + sec.toFixed(1) + 's</div>';
+        }).join('');
+    }
+
+    function updateEstimates() {
+        updateMainScanEstimate();
+        document.querySelectorAll('[data-est="range"]').forEach(cell => {
+            const r = ranges[+cell.dataset.i];
+            if (!r) return;
+            const { low, high } = effectiveRangeBounds(r);
+            paintEstimate(cell, estimateScanSeconds(low, high, effectiveRangeStep(r, low, high)));
+        });
+        document.querySelectorAll('[data-est="band"]').forEach(cell => {
+            const b = bands[+cell.dataset.i];
+            if (!b) return;
+            paintEstimate(cell, estimateScanSeconds(Number(b.start) / 1000, Number(b.end) / 1000, Number(b.step)));
+        });
+    }
+
+    ['fmLowerLimit', 'tuningStepSize', 'tuningRange', 'disableHfSpanLimit'].forEach(id => {
+        document.getElementById(id).addEventListener('input', updateEstimates);
+        document.getElementById(id).addEventListener('change', updateEstimates);
+    });
+
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            btn.classList.add('active');
+            document.getElementById(btn.dataset.target).classList.add('active');
+        });
+    });
+
+    function showToast(msg, isErr) {
+        const t = document.getElementById('toast');
+        t.textContent = msg;
+        t.className = isErr ? 'err show' : 'show';
+        setTimeout(() => { t.className = t.className.replace('show', '').trim(); }, 2800);
+    }
+
+    document.getElementById('resetBtn').addEventListener('click', () => {
+        if (!confirm('Reset all settings to their default values?')) return;
+        document.getElementById('rescanDelay').value      = DEFAULTS.rescanDelay;
+        document.getElementById('tuningRange').value      = DEFAULTS.tuningRange;
+        document.getElementById('tuningStepSize').value   = DEFAULTS.tuningStepSize;
+        document.getElementById('tuningBandwidth').value  = DEFAULTS.tuningBandwidth;
+        document.getElementById('fmLowerLimit').value     = DEFAULTS.fmLowerLimit;
+        document.getElementById('customRanges').value     = DEFAULTS.customRanges;
+        ranges = parseRangesString(DEFAULTS.customRanges);
+        renderRanges();
+        document.getElementById('disableHfSpanLimit').checked = DEFAULTS.disableHfSpanLimit;
+        document.getElementById('disableHfScanning').checked = DEFAULTS.disableHfScanning;
+        document.getElementById('sendBothBandwidthCommands').checked = DEFAULTS.sendBothBandwidthCommands;
+        document.getElementById('clearGraphOnScan').checked   = DEFAULTS.clearGraphOnScan;
+        document.getElementById('warnIncompleteData').checked = DEFAULTS.warnIncompleteData;
+        document.getElementById('logLocalCommands').checked   = DEFAULTS.logLocalCommands;
+        document.getElementById('progressiveScanEnabled').checked  = DEFAULTS.progressiveScanEnabled;
+        document.getElementById('progressiveScanSweepLine').value  = DEFAULTS.progressiveScanSweepLine;
+        document.getElementById('progressiveScanBatchMs').value    = DEFAULTS.progressiveScanBatchMs;
+        document.getElementById('progressiveScanReferenceClients').value = DEFAULTS.progressiveScanReferenceClients;
+        bands = DEFAULTS.definedBands.map(b => ({ ...b }));
+        renderBands();
+        CLIENT_FIELDS.forEach(f => {
+            const el = document.getElementById(f.key);
+            if (f.type === 'boolean') el.checked = DEFAULTS[f.key]; else el.value = DEFAULTS[f.key];
+        });
+        showToast('Defaults restored. Click Save Settings to apply.', false);
+    });
+
+    document.getElementById('saveBtn').addEventListener('click', async () => {
+        const btn = document.getElementById('saveBtn');
+        btn.disabled = true;
+        const payload = {
+            rescanDelay:        Number(document.getElementById('rescanDelay').value),
+            tuningRange:        Number(document.getElementById('tuningRange').value),
+            tuningStepSize:     Number(document.getElementById('tuningStepSize').value),
+            tuningBandwidth:    Number(document.getElementById('tuningBandwidth').value),
+            fmLowerLimit:       Number(document.getElementById('fmLowerLimit').value),
+            customRanges:       document.getElementById('customRanges').value,
+            disableHfSpanLimit: document.getElementById('disableHfSpanLimit').checked,
+            disableHfScanning:  document.getElementById('disableHfScanning').checked,
+            sendBothBandwidthCommands: document.getElementById('sendBothBandwidthCommands').checked,
+            warnIncompleteData: document.getElementById('warnIncompleteData').checked,
+            logLocalCommands:   document.getElementById('logLocalCommands').checked,
+            clearGraphOnScan:   document.getElementById('clearGraphOnScan').checked,
+            definedBands:       bands,
+            progressiveScanEnabled:   document.getElementById('progressiveScanEnabled').checked,
+            progressiveScanSweepLine: document.getElementById('progressiveScanSweepLine').value,
+            progressiveScanBatchMs:   Number(document.getElementById('progressiveScanBatchMs').value),
+            progressiveScanReferenceClients: Number(document.getElementById('progressiveScanReferenceClients').value),
+        };
+        CLIENT_FIELDS.forEach(f => {
+            const el = document.getElementById(f.key);
+            payload[f.key] = f.type === 'boolean' ? el.checked : f.type === 'number' ? Number(el.value) : el.value;
+        });
+        try {
+            const res = await fetch('/spectrum-graph-plugin/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            showToast(res.ok ? 'Settings saved.' : 'Save failed (' + res.status + ').', !res.ok);
+        } catch (e) { showToast('Network error.', true); }
+        btn.disabled = false;
+    });
+
+    renderBands();
+    renderRanges();
+
+    // Checked once on page load
+    (function showSlowScanBanner() {
+        const slow = [];
+        document.querySelectorAll('#mainScanEst .est-slow').forEach(el => {
+            const parts = el.textContent.split(': ');
+            slow.push('Main scan ' + escHtml(parts[0]) + ' (' + escHtml(parts[1]) + ')');
+        });
+        [['range', ranges], ['band', bands]].forEach(([kind, list]) => {
+            document.querySelectorAll('[data-est="' + kind + '"].est-slow').forEach(cell => {
+                const item = list[+cell.dataset.i];
+                if (item) slow.push(escHtml(item.name) + ' (' + escHtml(cell.textContent) + ')');
+            });
+        });
+        if (slow.length === 0) return;
+        document.querySelector('main').insertAdjacentHTML('beforebegin',
+            '<div class="banner banner-warn"><span class="banner-icon">&#9888;</span><div><b>Scan Time</b><br>' +
+            'Estimated to take longer than the 5 seconds before clients drop the connection: ' + slow.join(', ') +
+            '. Use a coarser step or a narrower range.</div></div>');
+    })();
+</script>
+</body>
+</html>`;
+        res.send(html);
+    });
+
+    endpointsRouter.get('/spectrum-graph-plugin', (req, res) => {
+        const pluginHeader = req.get('X-Plugin-Name') || 'NoPlugin';
+
+        if (pluginHeader === 'SpectrumGraphPlugin') {
+            // Fallback method to get IP address, less reliable
+            if (!useHooks) {
+                ipAddress = normalizeIp(
+                    isInternalScan
+                        ? '127.0.0.1'
+                        : req.headers['x-forwarded-for']?.split(',')[0] || req.ip || req.connection.remoteAddress || '127.0.0.1'
+                );
+
+                clearTimeout(ipTimeout);
+                ipTimeout = setTimeout(() => { ipAddress = externalWsUrl; }, 5000);
+            }
+
+            const serverTime = Math.floor(Date.now() / 1000);
+            res.json({ ...spectrumData, serverTime });
+        } else {
+            res.status(403).json({ error: 'Unauthorised' });
+        }
+    });
+
+    if (isFirstRun && typeof ipAddress !== 'undefined') logInfo(`[${pluginName}] Custom router added to endpoints router`);
+}
+
+// Update endpoint
+function updateSpectrumData(newData) {
+    spectrumData = { ...spectrumData, ...newData };
+}
+
+customRouter();
+
+scanStatus = { scanStatus: "waiting" };
+updateSpectrumData(scanStatus);
+
+// Default configuration
+let rescanDelay = 3; // seconds
+let tuningRange = 0; // MHz
+let tuningStepSize = 50; // kHz
+let tuningBandwidth = 56; // kHz
+let fmLowerLimit = 86; // Match dummyFreqStart value (default: 86)
+let customRanges = ""; // Custom ranges
+let disableHfSpanLimit = false; // Allow custom HF ranges wider than 3 MHz
+let disableHfScanning = true; // Block scans below 30 MHz
+let sendBothBandwidthCommands = false; // Send Sf and Sw during a scan, as XDR-GTK does
+let warnIncompleteData = false; // Warn about incomplete data
+let logLocalCommands = true; // Log locally sent commands
+let clearGraphOnScan = true; // Clear graph data when a new scan begins
+let progressiveScanEnabled = true; // Broadcast scan points live as they arrive
+let progressiveScanSweepLine = 'line'; // 'none' | 'line' | 'line-dot' | 'dot' | 'glow'
+let progressiveScanBatchMs = 100;
+let progressiveScanReferenceClients = 100;
+
+const DEFAULT_DEFINED_BANDS = [
+    { name: 'LW',   start: 144,   end: 351,   step: 1,  bw: 3  },
+    { name: 'MW',   start: 504,   end: 1710,  step: 3,  bw: 3  },
+    { name: '160m', start: 1711,  end: 2000,  step: 1,  bw: 3  },
+    { name: '120m', start: 2300,  end: 2500,  step: 1,  bw: 3  },
+    { name: '90m',  start: 3200,  end: 3400,  step: 1,  bw: 3  },
+    { name: '75m',  start: 3900,  end: 4000,  step: 1,  bw: 3  },
+    { name: '60m',  start: 4750,  end: 5060,  step: 2,  bw: 3  },
+    { name: '49m',  start: 5900,  end: 6200,  step: 2,  bw: 3  },
+    { name: '41m',  start: 7200,  end: 7600,  step: 2,  bw: 3  },
+    { name: '31m',  start: 9400,  end: 9900,  step: 2,  bw: 3  },
+    { name: '25m',  start: 11600, end: 12100, step: 2,  bw: 3  },
+    { name: '22m',  start: 13570, end: 13870, step: 2,  bw: 3  },
+    { name: '19m',  start: 15100, end: 15830, step: 2,  bw: 3  },
+    { name: '16m',  start: 17480, end: 17900, step: 2,  bw: 3  },
+    { name: '15m',  start: 18900, end: 19020, step: 1,  bw: 3  },
+    { name: '13m',  start: 21450, end: 21850, step: 2,  bw: 3  },
+    { name: '11m',  start: 25670, end: 26100, step: 2,  bw: 3  },
+    { name: 'OIRT', start: 65900, end: 74000, step: 30, bw: 56 },
+];
+let definedBands = DEFAULT_DEFINED_BANDS.map(b => ({ ...b }));
+
+// Client-side settings. One entry generates the config key, the settings field, validation and the value sent to clients
+const CLIENT_SETTINGS = [
+    { key: 'enableMouseClickToTune', type: 'boolean', def: true, section: 'interface',
+      label: 'Mouse Click to Tune', hint: 'Allow the mouse to tune by clicking inside the graph.' },
+    { key: 'enableMouseScrollWheel', type: 'boolean', def: true, section: 'interface',
+      label: 'Mouse Scroll Wheel to Tune', hint: 'Allow the mouse scroll wheel to tune while the pointer is inside the graph.' },
+    { key: 'correctTooltipPeaks', type: 'boolean', def: true, section: 'interface',
+      label: 'Correct Tooltip Peaks', hint: 'Corrects inconsistent signal-peak tooltips caused by FM and 50 kHz scan steps.' },
+    { key: 'displayScanningStatus', type: 'boolean', def: true, section: 'interface',
+      label: 'Display Scanning Status', hint: 'Default state of the spinning icon shown during a scan update. Saved User preference overrides.' },
+    { key: 'adjustScaleToOutline', type: 'boolean', def: true, section: 'interface',
+      label: 'Adjust Scale to Outline', hint: 'Adjust the auto baseline to the hold/relative outline instead of clamping it.' },
+    { key: 'decimalMarkerRoundOff', type: 'boolean', def: true, section: 'interface',
+      label: 'Round Off Decimal Markers', hint: 'Round frequency markers to the nearest integer. Only applies to scan spans wider than 10 MHz.' },
+    { key: 'snapMarkersToRoundValues', type: 'boolean', def: true, section: 'interface',
+      label: 'Snap Markers to Round Values', hint: 'Place markers on round values, else align them to the start of ranges below the FM band.' },
+    { key: 'hideRotatorContainer', type: 'boolean', def: false, section: 'interface',
+      label: 'Hide Rotator Container', hint: 'Hides the PST Rotator plugin container while the graph is open.' },
+    { key: 'backgroundBlurPixels', type: 'number', def: 5, min: 0, max: 50, step: 1, section: 'interface',
+      label: 'Background Blur', hint: 'Canvas background blur in pixels. Set to 0 to disable.' },
+    { key: 'scanCoverageOpacity', type: 'number', def: 0.2, min: 0, max: 1, step: 0.01, section: 'interface',
+      label: 'Scan Coverage Opacity', hint: "Opacity of the Scanner plugin's 'defaultScannerMode' coverage overlay." },
+    { key: 'defaultLanguage', type: 'string', def: 'en', section: 'interface',
+      label: 'Default Language', hint: 'Used when the browser language has no translation available. Available: en, en_us, es, fr, de, nl, ru, pl, cs, hu.' },
+    { key: 'mwTuningStep', type: 'number', def: 0, min: 0, max: 10, step: 1, section: 'advanced',
+      label: 'MW Tuning Step', hint: "MW tuning step in kHz (9 or 10). Set to 0 to use the 'Enhanced Tuning' plugin preference." },
+    { key: 'lastAntennaScanNoticeMinutes', type: 'number', def: 30, min: 0, max: 1440, step: 1, section: 'advanced',
+      label: 'Outdated Scan Notice', hint: 'Periodically display a notice if the last scan of any antenna is older than this many minutes. Set to 0 to disable.' },
+    { key: 'antennaScanNoticeTimeoutSeconds', type: 'number', def: 10, min: 1, max: 120, step: 1, section: 'advanced',
+      label: 'Notice Display Time', hint: 'How long the outdated scan notice stays on screen, in seconds.' },
+    { key: 'antennaScanNoticeIntervalSeconds', type: 'number', def: 180, min: 10, max: 3600, step: 10, section: 'advanced',
+      label: 'Notice Interval', hint: 'How often the outdated scan check repeats, in seconds.' },
+    { key: 'calRfLevelOffset', type: 'number', def: 0, min: -50, max: 50, step: 0.01, section: 'advanced',
+      label: 'Signal Offset', hint: 'Overall signal calibration offset in dB, to compensate for feeder loss or gain.' },
+    { key: 'cal90000', type: 'number', def: 0, min: -50, max: 50, step: 0.1, section: 'advanced',
+      label: 'Calibration 87-93 MHz', hint: 'Signal calibration in dB. Requires external hardware to set a known signal strength.' },
+    { key: 'cal95500', type: 'number', def: 0, min: -50, max: 50, step: 0.1, section: 'advanced',
+      label: 'Calibration 93-98 MHz', hint: 'Signal calibration in dB.' },
+    { key: 'cal100500', type: 'number', def: 0, min: -50, max: 50, step: 0.1, section: 'advanced',
+      label: 'Calibration 98-103 MHz', hint: 'Signal calibration in dB.' },
+    { key: 'cal105500', type: 'number', def: 0, min: -50, max: 50, step: 0.1, section: 'advanced',
+      label: 'Calibration 103-108 MHz', hint: 'Signal calibration in dB.' },
+];
+
+const clientSettings = {};
+CLIENT_SETTINGS.forEach(s => { clientSettings[s.key] = s.def; });
+
+function coerceClientSetting(s, value) {
+    if (s.type === 'boolean') return typeof value === 'boolean' ? value : s.def;
+    if (s.type === 'number') {
+        const n = Number(value);
+        return (value === '' || value === null || !Number.isFinite(n)) ? s.def : Math.min(s.max, Math.max(s.min, n));
+    }
+    return (typeof value === 'string' && value.trim() !== '') ? value.trim().slice(0, 16) : s.def;
+}
+
+const defaultConfig = {
+    rescanDelay: 3,
+    tuningRange: 0,
+    tuningStepSize: 50,
+    tuningBandwidth: 56,
+    fmLowerLimit: 86,
+    customRanges: "",
+    disableHfSpanLimit: false,
+    disableHfScanning: true,
+    sendBothBandwidthCommands: false,
+    warnIncompleteData: false,
+    logLocalCommands: true,
+    clearGraphOnScan: true,
+    progressiveScanEnabled: true,
+    progressiveScanSweepLine: 'line',
+    progressiveScanBatchMs: 100,
+    progressiveScanReferenceClients: 100,
+    ...Object.fromEntries(CLIENT_SETTINGS.map(s => [s.key, s.def])),
+    definedBands: DEFAULT_DEFINED_BANDS,
+};
+
+// Order of keys in configuration file
+const configKeyOrder = ['rescanDelay', 'tuningRange', 'tuningStepSize', 'tuningBandwidth', 'fmLowerLimit', 'customRanges', 'disableHfSpanLimit', 'disableHfScanning', 'sendBothBandwidthCommands', 'warnIncompleteData', 'logLocalCommands', 'clearGraphOnScan', 'progressiveScanEnabled', 'progressiveScanSweepLine', 'progressiveScanBatchMs', 'progressiveScanReferenceClients', ...CLIENT_SETTINGS.map(s => s.key), 'definedBands'];
+
+// Function to ensure folder and file exist
+function checkConfigFile() {
+    // Check if plugins_configs folder exists
+    if (!fs.existsSync(configFolderPath)) {
+        logInfo(`[${pluginName}] Creating plugins_configs folder...`);
+        fs.mkdirSync(configFolderPath, { recursive: true }); // Create folder recursively if needed
+    }
+
+    // Check if json file exists
+    if (!fs.existsSync(configFilePath)) {
+        logInfo(`[${pluginName}] Creating default SpectrumGraph.json file...`);
+        saveDefaultConfig(); // Save default configuration
+    }
+}
+
+checkConfigFile();
+
+// Function to load configuration file
+function loadConfigFile(isReloaded) {
+    try {
+        if (fs.existsSync(configFilePath)) {
+            const configContent = fs.readFileSync(configFilePath, 'utf-8');
+            let config = JSON.parse(configContent);
+
+            let configModified = false;
+
+            // Check and add missing options with default values
+            for (let key in defaultConfig) {
+                if (!(key in config)) {
+                    logInfo(`[${pluginName}] Missing ${key} in config. Adding default value.`);
+                    config[key] = defaultConfig[key]; // Add missing keys with default value
+                    configModified = true; // Mark as modified
+                }
+            }
+
+            // Ensure variables are numbers or booleans
+            rescanDelay = !isNaN(Number(config.rescanDelay)) ? Number(config.rescanDelay) : defaultConfig.rescanDelay;
+            tuningRange = !isNaN(Number(config.tuningRange)) ? Number(config.tuningRange) : defaultConfig.tuningRange;
+            tuningStepSize = !isNaN(Number(config.tuningStepSize)) ? Number(config.tuningStepSize) : defaultConfig.tuningStepSize;
+            tuningBandwidth = !isNaN(Number(config.tuningBandwidth)) ? Number(config.tuningBandwidth) : defaultConfig.tuningBandwidth;
+            fmLowerLimit = !isNaN(Number(config.fmLowerLimit)) ? Number(config.fmLowerLimit) : defaultConfig.fmLowerLimit;
+            customRanges = typeof config.customRanges === 'string' ? config.customRanges : '';
+            disableHfSpanLimit = typeof config.disableHfSpanLimit === 'boolean' ? config.disableHfSpanLimit : defaultConfig.disableHfSpanLimit;
+            disableHfScanning = typeof config.disableHfScanning === 'boolean' ? config.disableHfScanning : defaultConfig.disableHfScanning;
+            sendBothBandwidthCommands = typeof config.sendBothBandwidthCommands === 'boolean' ? config.sendBothBandwidthCommands : defaultConfig.sendBothBandwidthCommands;
+            warnIncompleteData = typeof config.warnIncompleteData === 'boolean' ? config.warnIncompleteData : defaultConfig.warnIncompleteData;
+            logLocalCommands = typeof config.logLocalCommands === 'boolean' ? config.logLocalCommands : defaultConfig.logLocalCommands;
+            clearGraphOnScan = typeof config.clearGraphOnScan === 'boolean' ? config.clearGraphOnScan : defaultConfig.clearGraphOnScan;
+            progressiveScanEnabled = typeof config.progressiveScanEnabled === 'boolean' ? config.progressiveScanEnabled : defaultConfig.progressiveScanEnabled;
+            progressiveScanSweepLine = VALID_SWEEP_LINES.includes(config.progressiveScanSweepLine) ? config.progressiveScanSweepLine : defaultConfig.progressiveScanSweepLine;
+            progressiveScanBatchMs = !isNaN(Number(config.progressiveScanBatchMs)) ? Math.min(2000, Math.max(20, Number(config.progressiveScanBatchMs))) : defaultConfig.progressiveScanBatchMs;
+            progressiveScanReferenceClients = !isNaN(Number(config.progressiveScanReferenceClients)) ? Math.min(100, Math.max(1, Number(config.progressiveScanReferenceClients))) : defaultConfig.progressiveScanReferenceClients;
+
+            CLIENT_SETTINGS.forEach(s => { clientSettings[s.key] = coerceClientSetting(s, config[s.key]); });
+
+            if (Array.isArray(config.definedBands) && config.definedBands.length > 0 &&
+                config.definedBands.every(b => b && typeof b.name === 'string' &&
+                    Number.isFinite(b.start) && Number.isFinite(b.end) &&
+                    Number.isFinite(b.step) && Number.isFinite(b.bw))) {
+                definedBands = config.definedBands;
+            } else {
+                definedBands = DEFAULT_DEFINED_BANDS.map(b => ({ ...b }));
+            }
+
+            structureCustomRanges();
+            updateSpectrumData({ progressiveScanEnabled, progressiveScanSweepLine, progressiveScanBatchMs, tuningStepSize, tuningBandwidth });
+
+            // Save the updated config if there were any modifications
+            if (configModified) {
+                saveUpdatedConfig(config);
+            }
+
+            logInfo(`[${pluginName}] Configuration ${isReloaded || ''}loaded successfully.`);
+        } else {
+            logInfo(`[${pluginName}] Configuration file not found. Creating default configuration.`);
+            saveDefaultConfig();
+        }
+    } catch (error) {
+        logInfo(`[${pluginName}] Error loading configuration file: ${error.message}. Resetting to default.`);
+        saveDefaultConfig();
+    }
+}
+
+function stringifyWithCompactBands(config, indent = 4) {
+    const orderedConfig = {};
+    configKeyOrder.forEach(key => {
+        if (key in config) {
+            orderedConfig[key] = config[key];
+        }
+    });
+
+    let json = JSON.stringify(orderedConfig, null, indent);
+
+    json = json.replace(/"definedBands":\s*\[([\s\S]*?)\]/, () => {
+        const bands = config.definedBands || [];
+
+        const compactLines = bands.map(band => {
+            // Create formatted compact object with spaces
+            const objStr = JSON.stringify(band, null, 0)
+                .replace(/":/g, '": ')           // space after colon
+                .replace(/,"/g, ', "')           // space after comma
+                .replace(/(\d)"/g, '$1"');       // no space before closing quote after numbers
+
+            return ' '.repeat(indent * 2) + objStr;
+        });
+
+        return `"definedBands": [\n${compactLines.join(',\n')}\n${' '.repeat(indent)}]`;
+    });
+
+    return json;
+}
+
+// Function to save default configuration file
+function saveDefaultConfig() {
+    const formattedConfig = stringifyWithCompactBands(defaultConfig, 4);
+    if (!fs.existsSync(configFolderPath)) {
+        fs.mkdirSync(configFolderPath, { recursive: true });
+    }
+    fs.writeFileSync(configFilePath, formattedConfig);
+    loadConfigFile();
+}
+
+// Function to save updated configuration after modification
+function saveUpdatedConfig(config) {
+    const formattedConfig = stringifyWithCompactBands(config, 4);
+    fs.writeFileSync(configFilePath, formattedConfig);
+}
+
+let suppressNextFileWatchReload = false;
+
+// Function to watch configuration file for changes
+function watchConfigFile() {
+    fs.watch(configFilePath, (eventType) => {
+        if (eventType === 'change') {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                if (suppressNextFileWatchReload) {
+                    suppressNextFileWatchReload = false;
+                    return;
+                }
+                loadConfigFile('re');
+            }, 800);
+        }
+    });
+}
+
+function structureCustomRanges() {
+    // Clear any previous ranges
+    formattedCustomRanges = [];
+    updateSpectrumData({ 
+        fmRangeName: '', 
+        fmRangeFreq: '', 
+        customRangeNames: '[]', 
+        customRangeFreqs: '[]' 
+    });
+
+    // Add FM range
+    const fmRangeLowerLimit = Number(fmLowerLimit) || 86;
+    const fmRangeUpperLimit = Number(config?.webserver?.tuningUpperLimit) || 108;
+    let fmRange = null;
+
+    if (!isNaN(fmRangeLowerLimit) && !isNaN(fmRangeUpperLimit)) {
+        fmRange = {
+            name: 'FM',
+            rangeString: `${fmRangeLowerLimit}-${fmRangeUpperLimit} MHz`
+        };
+    }
+
+    // Parse custom ranges
+    if (customRanges && typeof customRanges === 'string') {
+        const parts = customRanges.split(',').map(p => p.trim());
+        const numRanges = Number(parts[0]) || 0;
+
+        let pos = 1;
+        for (let i = 0; i < numRanges; i++) {
+            const name = parts[pos];
+            const low = Number(parts[pos + 1]);
+            const high = Number(parts[pos + 2]);
+
+            const maybeStep = parts[pos + 3];
+            const hasStep = maybeStep !== undefined && !isNaN(Number(maybeStep)) && Number(maybeStep) > 0;
+            const step = hasStep ? Number(maybeStep) : null;
+
+            if (name && !isNaN(low) && !isNaN(high)) {
+                formattedCustomRanges.push({
+                    name,
+                    low,
+                    high,
+                    step,
+                    rangeString: `${low}-${high} MHz`
+                });
+            }
+
+            pos += hasStep ? 4 : 3;
+        }
+    }
+
+    // Separate arrays for client use
+    const customRangeNames = formattedCustomRanges.map(r => r.name);
+    const customRangeFreqs = formattedCustomRanges.map(r => r.rangeString);
+
+    updateSpectrumData({
+        fmRangeName: fmRange?.name || '',
+        fmRangeFreq: fmRange?.rangeString || '',
+        fmLowerLimit,
+        customRangeNames,
+        customRangeFreqs
+    });
+
+    if (debug) console.log('FM:', fmRange, 'Custom:', formattedCustomRanges);
+}
+
+// Initialise configuration system
+function initConfigSystem() {
+    loadConfigFile(); // Load configuration values initially
+    watchConfigFile(); // Monitor for changes
+    logInfo(`[${pluginName}] Rescan Delay: ${rescanDelay} sec, Tuning Range: ${tuningRange ? tuningRange + ' MHz' : 'Full MHz'}, Tuning Steps: ${tuningStepSize} kHz, Bandwidth: ${tuningBandwidth} kHz`);
+}
+
+initConfigSystem();
+
+// Serialport status variables
+let alreadyWarnedMissingSerialportVars = false;
+let getSerialportStatus = null;
+
+(function initSerialportStatusSource() {
+  if (
+    datahandlerReceived?.state &&
+    typeof datahandlerReceived.state.isSerialportAlive !== 'undefined' &&
+    typeof datahandlerReceived.state.isSerialportRetrying !== 'undefined'
+  ) {
+    getSerialportStatus = () => ({
+      isAlive: datahandlerReceived.state.isSerialportAlive,
+      isRetrying: datahandlerReceived.state.isSerialportRetrying
+    });
+  } else if (
+    typeof isSerialportAlive !== 'undefined' &&
+    typeof isSerialportRetrying !== 'undefined'
+  ) {
+    getSerialportStatus = () => ({
+      isAlive: isSerialportAlive,
+      isRetrying: isSerialportRetrying
+    });
+    logWarn(`[${pluginName}] Older Serialport status variables found, update FM-DX Webserver`);
+  } else {
+    if (!alreadyWarnedMissingSerialportVars) {
+      alreadyWarnedMissingSerialportVars = true;
+      logWarn(`[${pluginName}] Serialport status variables not found.`);
+    }
+  }
+})();
+
+function checkSerialportStatus() {
+  if (!getSerialportStatus) return;
+
+  const { isAlive, isRetrying } = getSerialportStatus();
+
+  if (!isAlive || isRetrying) {
+    if (!useHooks) {
+      if (textSocketLost) {
+        clearTimeout(textSocketLost);
+      }
+
+      textSocketLost = setTimeout(() => {
+        logWarn(`[${pluginName}] Connection lost, creating new WebSocket.`);
+        if (textSocket) {
+          try {
+            textSocket.close(1000, 'Normal closure');
+          } catch (error) {
+            logWarn(`${pluginName} error closing WebSocket:`, error);
+          }
+        }
+        textSocketLost = null;
+      }, 10000);
+    } else {
+      if (!serialConnectionLoss) {
+          serialConnectionLoss = true;
+          logWarn(`[${pluginName}] Connection loss detected.`);
+      }
+
+      clearInterval(intervalSerialReconnect);
+      intervalSerialReconnect = setTimeout(() => {
+        logWarn(`[${pluginName}] Connection lost, restarting.`);
+        serialConnectionLoss = false;
+          try {
+            if (restartCounter > 65000) restartCounter = 0;
+            restartCounter++;
+            startPluginStartup();
+          } catch (error) {
+            logWarn(`[${pluginName}] Error reconnecting:`, error);
+          }
+      }, 10000);
+    }
+  }
+}
+
+// Track connected clients for broadcasting (/data_plugins)
+const pluginClients = new Set();
+
+// Broadcast function for plugin clients (sigArray)
+function broadcastToPluginClients(data) {
+    const message = typeof data === 'string' ? data : JSON.stringify(data);
+    pluginClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
+
+// Handler for main WebSocket connections (no message processing needed)
+function handleMainConnection(ws, req) {
+    if (req.url !== '/text') return;
+
+    ws.on('error', (error) => logError(`${pluginName} WebSocket error:`, error));
+
+    ws.on('close', () => {
+        //logInfo(`${pluginName} WebSocket client connection closed (/text)`);
+    });
+}
+
+let lastLockLogTime = 0;
+const LOCK_LOG_INTERVAL = 30000;
+
+// Handler for plugins WebSocket connections
+function handlePluginConnection(ws, req) {
+    if (req?.url !== '/data_plugins') {
+        return;
+    }
+
+    pluginClients.add(ws);
+
+    ws.on('message', (data) => {
+        try {
+            const message = JSON.parse(data.toString());
+
+            // Ignore messages that aren't for spectrum-graph or don't have a status
+            if (message.type !== 'spectrum-graph' || !(message.value && 'status' in message.value) || scanStatus.scanStatus === 'scanning') return;
+
+            // Track IP for scan commands
+            if (validScans.includes(message.value?.status)) {
+                const scanIp = ws._socket?.remoteAddress || '127.0.0.1';
+                ipAddress = normalizeIp(scanIp);
+
+                clearTimeout(ipTimeout);
+                ipTimeout = setTimeout(() => { ipAddress = externalWsUrl; }, 5000);
+            }
+
+            const session = req?.session || {};
+            const isAdmin = session.isAdminAuthenticated || session.isTuneAuthenticated;
+            const isLocked = !serverConfig.publicTuner || serverConfig.lockToAdmin;
+
+            if (isLocked && !isAdmin) {
+                const now = Date.now();
+                if (now - lastLockLogTime > LOCK_LOG_INTERVAL) {
+                    logInfo(`[${pluginName}] Scan request ignored for non-admin during lock`);
+                    lastLockLogTime = now;
+                }
+                return;
+            }
+
+            // Handle valid or unknown messages with debounce
+            if (!messageParsedTimeout) {
+                const status = message.value?.status;
+
+                if (validScans.includes(status)) {
+                    if (!isFirstRun && !isScanRunning) {
+                        restartScan(status, msg => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); });
+                    }
+                } else {
+                    const msgStr = JSON.stringify(message);
+                    logError(`${pluginName} unknown command received: ${msgStr.length > 128 ? msgStr.slice(0, 128) + '…' : msgStr}`);
+                }
+
+                messageParsedTimeout = true;
+
+                if (messageParsed) clearInterval(messageParsed);
+                messageParsed = setTimeout(() => {
+                    if (messageParsed) clearInterval(messageParsed);
+                    messageParsedTimeout = false;
+                }, 150); // Reduce spamming
+            }
+
+        } catch (error) {
+            logError(`${pluginName}: Failed to handle message:`, error);
+        }
+    });
+
+    ws.on('error', (error) => {
+        logError(`${pluginName} WebSocket error:`, error);
+    });
+
+    ws.on('close', () => {
+        pluginClients.delete(ws);
+        //logInfo(`${pluginName} WebSocket client connection closed (/data_plugins)`);
+    });
+}
+
+// Function for 'text' WebSocket
+async function TextWebSocket(messageData) {
+    if (!textSocket || textSocket.readyState === WebSocket.CLOSED) {
+        try {
+            textSocket = new WebSocket(`${externalWsUrl}/text`);
+
+            textSocket.onopen = () => {
+                // Spectrum Graph connected to WebSocket
+
+                // Launch startup antenna sequence 
+
+                startPluginStartup();
+
+                textSocket.onmessage = (event) => {
+                    try {
+                        // Parse incoming message data
+                        const messageData = JSON.parse(event.data);
+                        // console.log(messageData);
+
+                        if (messageData.freq !== undefined && !isNaN(messageData.freq)) {
+                            currentFrequency = Number(messageData.freq); // Used when fallback is used, unless 'datahandlerReceived.handleData' receives it first
+                        }
+
+                        checkSerialportStatus();
+
+                    } catch (error) {
+                        logError(`${pluginName} failed to parse WebSocket message:`, error);
+                    }
+                };
+            };
+
+            textSocket.onerror = (error) => logError(`${pluginName} WebSocket error:`, error);
+
+            textSocket.onclose = () => {
+                logInfo(`[${pluginName}] WebSocket closed (/text)`);
+                textSocket = null;
+                setTimeout(() => TextWebSocket(messageData), 2000); // Pass messageData when reconnecting
+            };
+
+        } catch (error) {
+            logError(`${pluginName} failed to set up WebSocket:`, error);
+            textSocket = null;
+            setTimeout(() => TextWebSocket(messageData), 2000); // Pass messageData when reconnecting
+        }
+    }
+}
+
+// Function for 'data_plugins' WebSocket
+async function ExtraWebSocket() {
+    if (!extraSocket || extraSocket.readyState === WebSocket.CLOSED) {
+        try {
+            extraSocket = new WebSocket(`${externalWsUrl}/data_plugins`);
+
+            extraSocket.onopen = () => {
+                // Spectrum Graph connected to '/data_plugins'
+            };
+
+            extraSocket.onerror = (error) => {
+                logError(`${pluginName} WebSocket error:`, error);
+            };
+
+            extraSocket.onclose = () => {
+                logInfo(`[${pluginName}] WebSocket closed (/data_plugins)`);
+                setTimeout(ExtraWebSocket, 2000); // Reconnect after delay
+            };
+
+            extraSocket.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    //logInfo(JSON.stringify(message));
+
+                    // Ignore messages that aren't for spectrum-graph or don't have a status
+                    if (message.type !== 'spectrum-graph' || !(message.value && 'status' in message.value)) return;
+
+                    if (!messageParsedTimeout) {
+                        const status = message.value?.status;
+
+                        if (validScans.includes(status)) {
+                            // Relay mode can't tell clients apart, so the notice goes to all of them
+                            if (!isFirstRun && !isScanRunning) restartScan(status, msg => sendSigArray(null, {}, msg));
+                        } else {
+                            const msgStr = JSON.stringify(message);
+                            logError(`${pluginName} unknown command received: ${msgStr.length > 128 ? msgStr.slice(0, 128) + '…' : msgStr}`);
+                        }
+
+                        messageParsedTimeout = true;
+
+                        if (messageParsed) clearInterval(messageParsed);
+                        messageParsed = setTimeout(() => {
+                            if (messageParsed) clearInterval(messageParsed);
+                            messageParsedTimeout = false;
+                        }, 150); // Reduce spamming
+                    }
+
+                } catch (error) {
+                    logError(`${pluginName}: Failed to handle message:`, error);
+                }
+            };
+        } catch (error) {
+            logError(`${pluginName}: Failed to set up WebSocket:`, error);
+            setTimeout(ExtraWebSocket, 2000); // Reconnect on failure
+        }
+    }
+}
+
+if (useHooks && wss && pluginsWss) {
+    wss.on('connection', handleMainConnection);
+    pluginsWss.on('connection', handlePluginConnection);
+    logInfo(`[${pluginName}] WebSocket servers hooked`);
+
+    startPluginStartup();
+
+    if (AUTO_RESTART_ON_CONNECTION_ERROR) {
+        clearInterval(intervalSerial);
+        intervalSerial = setInterval(() => {
+                checkSerialportStatus();
+        }, 2000);
+    }
+} else {
+    // Legacy fallback clients
+    TextWebSocket();
+    ExtraWebSocket();
+}
+
+// Intercepted data storage
+let interceptedUData = null;
+let interceptedZData = null;
+
+let liveScanBuffer = '';
+let liveScanCapturing = false;
+let liveScanEventCount = 0; // Raw-data events contributing to the current capture - 1 means the whole scan arrived as a single burst
+let pendingScanPoints = [];
+let scanBatchTimer = null;
+let throttleWarnedThisScan = false;
+
+const PROGRESSIVE_SCAN_MAX_BATCH_MS = 5000; // Hard ceiling regardless of client count
+
+function scheduleScanBatchFlush() {
+    if (scanBatchTimer) return;
+
+    // Above the reference count, stretch the interval proportionally to keep total bandwidth roughly flat
+    const clientCount = pluginClients.size;
+    const isThrottled = clientCount > progressiveScanReferenceClients;
+    let effectiveBatchMs = isThrottled
+        ? progressiveScanBatchMs * (clientCount / progressiveScanReferenceClients)
+        : progressiveScanBatchMs;
+    effectiveBatchMs = Math.min(effectiveBatchMs, PROGRESSIVE_SCAN_MAX_BATCH_MS);
+
+    if (isThrottled && !throttleWarnedThisScan) {
+        throttleWarnedThisScan = true;
+        logWarn(`[${pluginName}] ${clientCount} /data_plugins connections open, batch interval stretched to ${Math.round(effectiveBatchMs)}ms`);
+    }
+
+    scanBatchTimer = setTimeout(flushPendingScanPoints, effectiveBatchMs);
+}
+
+function flushPendingScanPoints() {
+    scanBatchTimer = null;
+    if (pendingScanPoints.length === 0) return;
+    broadcastToPluginClients(JSON.stringify({ type: 'sigArrayPoints', value: pendingScanPoints }));
+    pendingScanPoints = [];
+}
+
+// Wrapper to intercept 'U' data
+const originalHandleData = datahandlerReceived.handleData;
+
+// datahandler code
+datahandlerReceived.handleData = function(wss, receivedData, rdsWss) {
+    const receivedLines = receivedData.split('\n');
+
+    for (const receivedLine of receivedLines) {
+        if (receivedLine.startsWith('T')) {
+            // If found via command sent
+            const freqStr = receivedLine.substring(1);
+            currentFrequency = parseInt(freqStr, 10) / 1000;
+            if (debug) logInfo(`[${pluginName}] Frequency updated: ${currentFrequency}`); // Debug
+        } else if (datahandlerReceived.dataToSend?.freq) {
+            // If found via dataToSend (datahandler.js)
+            const freqStr = datahandlerReceived.dataToSend.freq.replace(/^0+/, '');
+            currentFrequency = Number(freqStr);
+            //logInfo(`[${pluginName}] Frequency updated from dataToSend: ${currentFrequency}`); // Debug
+        }
+
+        if (receivedLine.startsWith('U')) {
+            interceptedUData = receivedLine.substring(1); // Store 'U' data
+
+            // Remove trailing comma and space in TEF668X radio firmware
+            if (interceptedUData && interceptedUData.endsWith(', ')) {
+                interceptedUData = interceptedUData.slice(0, -2);
+                if (deviceConfig !== 'xdr') {
+                    isModule = false; // Firmware now detected as TEF668X radio
+                    firmwareType = "TEF668X radio";
+                }
+            } else if (deviceConfig !== 'xdr') {
+                isModule = true;
+                firmwareType = deviceConfig === 'si47xx' ? deviceName : "TEF668X module"; // Si47XX firmware replies in the module format
+            }
+            isFirmwareDetected = true;
+
+            interceptedUData = interceptedUData.replaceAll(" ", ""); // Remove any spaces regardless of firmware
+
+            // Remove any further erroneous data if found
+            if (interceptedUData && /Z.$/.test(interceptedUData)) { // Remove any 'Z' antenna commands
+                interceptedUData = interceptedUData.slice(0, -2);
+            }
+            let scanIsComplete = true;
+            if (interceptedUData && interceptedUData.endsWith(',')) { // Some firmware might still have a trailing comma
+                interceptedUData = interceptedUData.slice(0, -1);
+                scanIsComplete = false;
+                if (warnIncompleteData) {
+                    logWarn(`[${pluginName}] Spectrum scan appears incomplete.`);
+                    scanStatus = { scanStatus: "incomplete" };
+                    updateSpectrumData(scanStatus);
+                }
+            }
+            if (interceptedUData) { // Remove any non-digit characters at the end
+                interceptedUData = interceptedUData.replace(/\D+$/, '');
+            }
+
+            // Update endpoint
+            const lastUpdate = Math.floor(Date.now() / 1000);
+            const newData = { sd: interceptedUData, lastUpdate: lastUpdate, isScanComplete: scanIsComplete };
+            updateSpectrumData(newData);
+
+            if (antennaSwitch) {
+                // Update endpoint
+                const newData = { [`sd${antennaCurrent}`]: interceptedUData, [`lastUpdate${antennaCurrent}`]: lastUpdate };
+                updateSpectrumData(newData);
+            }
+            break;
+        }
+        if (receivedLine.startsWith('Z')) {
+            interceptedZData = receivedLine.substring(1); // Store 'Z' data
+            // Update endpoint
+            const newData = { ad: interceptedZData };
+            updateSpectrumData(newData);
+
+            if (antennaSwitch) antennaCurrent = Number(interceptedZData);
+
+            let uValueNew = null;
+
+            if (antennaSwitch && spectrumData[`sd${antennaCurrent}`]) {
+                uValueNew = spectrumData[`sd${antennaCurrent}`];
+            }
+
+            if (uValueNew !== null) {
+                let uValue = uValueNew;
+
+                // Possibly interrupted, but should never execute, as trailing commas should have already been removed
+                if (uValue && uValue.endsWith(',')) {
+                    isScanHalted(true);
+                    uValue = null;
+                    setTimeout(() => {
+                        // Update endpoint
+                        const newData = { [`sd${antennaCurrent}`]: uValue }; // uValue or null
+                        updateSpectrumData(newData);
+                        logWarn(`[${pluginName}] Spectrum scan appears incomplete.`);
+                        scanStatus = { scanStatus: "incomplete" };
+                        updateSpectrumData(scanStatus);
+                    }, 200);
+                }
+
+                if (uValue !== null) { // Ensure uValue is not null before splitting
+                    // Split the response into pairs and process each one
+                    sigArray = uValue.split(',').map(pair => {
+                        const [freq, sig] = pair.split('=');
+                        return { freq: (freq / 1000).toFixed(3), sig: parseFloat(sig).toFixed(1) };
+                    });
+
+                    const messageClient = JSON.stringify({
+                        type: 'sigArray',
+                        value: sigArray,
+                        isScanning: isScanRunning
+                    });
+
+                    sendSigArray(sigArray, { pluginBroadcast: false }); // Send data
+
+                } else {
+                    logWarn(`${pluginName}: Invalid 'uValue' for Ant. ${antennaCurrent}, clearing incomplete data.`);
+                }
+                isScanHalted(true);
+            }
+            break;
+        }
+    }
+
+    // Call original handleData function
+    originalHandleData(wss, receivedData, rdsWss);
+};
+
+// ########## TO BE REMOVED AFTER RAW SERIAL DATA IS NATIVELY SUPPORTED ##########
+
+// For webservers without plugins_api.onRawSerialData (fm-dx-webserver PR #212)
+// adds the same API to plugins_api
+function installRawSerialDataFallback() {
+    if (!pluginsApi || typeof pluginsApi.onRawSerialData === 'function' || typeof pluginsApi.emitRawSerialData === 'function') return;
+
+    const helpers = require(rootDir + '/server/helpers');
+    if (typeof helpers.resolveDataBuffer !== 'function') return;
+
+    const listeners = new Set();
+
+    pluginsApi.onRawSerialData = handler => { listeners.add(handler); };
+    pluginsApi.offRawSerialData = handler => { listeners.delete(handler); };
+    pluginsApi.emitRawSerialData = data => {
+        for (const handler of listeners) {
+            try {
+                handler(data);
+            } catch (error) {
+                logError(`[plugins_api] Raw serial data handler error: ${error.message}`);
+            }
+        }
+    };
+
+    // Every chunk from the serial port and xdrd passes through this function
+    const originalResolveDataBuffer = helpers.resolveDataBuffer;
+    helpers.resolveDataBuffer = function (data, ...rest) {
+        const result = originalResolveDataBuffer.call(this, data, ...rest);
+        pluginsApi.emitRawSerialData(data);
+        return result;
+    };
+
+    logInfo(`[${pluginName}] Using built-in raw serial data hook for progressive scan`);
+}
+
+try {
+    installRawSerialDataFallback();
+} catch (error) {
+    logError(`[${pluginName}] Raw serial data hook failed: ${error.message}`);
+}
+
+// ###############################################################################
+
+const progressiveScanAvailable = !!(pluginsApi && typeof pluginsApi.onRawSerialData === 'function');
+updateSpectrumData({ progressiveScanAvailable });
+
+if (progressiveScanAvailable) {
+    pluginsApi.onRawSerialData((data) => {
+        try {
+            if (progressiveScanEnabled && isScanRunning) {
+                liveScanBuffer += data.toString();
+
+                if (!liveScanCapturing) {
+                    const uMatch = liveScanBuffer.match(/(?:^|\n)U/);
+                    if (uMatch) {
+                        liveScanCapturing = true;
+                        liveScanEventCount = 0;
+                        liveScanBuffer = liveScanBuffer.slice(uMatch.index + uMatch[0].length);
+                    } else if (liveScanBuffer.length > 4096) {
+                        liveScanBuffer = liveScanBuffer.slice(-256); // avoid unbounded growth from unrelated traffic
+                    }
+                }
+
+                if (liveScanCapturing) {
+                    liveScanEventCount++;
+                    const newlineIdx = liveScanBuffer.indexOf('\n');
+                    const scanEnded = newlineIdx !== -1;
+                    const workingStr = scanEnded ? liveScanBuffer.slice(0, newlineIdx) : liveScanBuffer;
+                    const parts = workingStr.split(',');
+                    const completeParts = scanEnded ? parts : parts.slice(0, -1);
+
+                    for (const part of completeParts) {
+                        const [freqStr, sigStr] = part.split('=');
+                        const freq = Number(freqStr);
+                        const sig = Number(sigStr);
+                        if (!Number.isFinite(freq) || !Number.isFinite(sig)) continue;
+
+                        pendingScanPoints.push({ freq: (freq / 1000).toFixed(3), sig: sig.toFixed(1) });
+                    }
+
+                    liveScanBuffer = scanEnded ? '' : (parts[parts.length - 1] || '');
+                    if (scanEnded) {
+                        liveScanCapturing = false;
+                        if (scanBatchTimer) clearTimeout(scanBatchTimer);
+
+                        if (liveScanEventCount <= 1) {
+                            progressiveSingleBurstScans++;
+                            logWarn(`[${pluginName}] Scan data arrived as single burst, if this persists, disable Progressive Scan in settings.`);
+                        } else {
+                            progressiveSingleBurstScans = 0; // One streamed scan proves the data path works
+                        }
+
+                        flushPendingScanPoints();
+                    } else if (pendingScanPoints.length) {
+                        scheduleScanBatchFlush();
+                    }
+                }
+            } else if (liveScanBuffer || liveScanCapturing) {
+                liveScanBuffer = '';
+                liveScanCapturing = false;
+            }
+        } catch (error) {
+            logError(`[${pluginName}] Progressive scan parsing failed, skipping:`, error.message);
+            liveScanBuffer = '';
+            liveScanCapturing = false;
+        }
+    });
+} else {
+    logWarn(`[${pluginName}] plugins_api.onRawSerialData unavailable, progressive scan disabled, update FM-DX Webserver`);
+}
+
+// Configure antennas
+let antennaCurrent; // Will remain 'undefined' if antenna switch is disabled
+let antennaSwitch = false;
+let antennaResponse = { enabled: false };
+if (config.antennas) antennaResponse = config.antennas;
+
+if (antennaResponse.enabled) { // Continue if 'enabled' is true
+    antennaSwitch = true;
+    antennaCurrent = Number(config.antennaStartup) || 0; // Default antenna from config
+    const antennas = ['ant1', 'ant2', 'ant3', 'ant4'];
+
+    let antennaStatus = {};
+
+    antennas.forEach(ant => {
+        antennaStatus[ant] = antennaResponse[ant].enabled; // antennaResponse.antX.enabled set to true or false
+    });
+
+    // Assign null to antennas enabled
+    [1, 2, 3, 4].forEach((i) => {
+        if (antennaResponse[`ant${i}`].enabled) {
+            // Update endpoint
+            const newData = { [`sd${i - 1}`]: null };
+            updateSpectrumData(newData);
+        }
+    });
+}
+
+function waitForAntenna(expectedAntenna, timeout = 5000, interval = 20) {
+    return new Promise((resolve, reject) => {
+        const start = Date.now();
+
+        const timer = setInterval(() => {
+            if (String(interceptedZData) === String(expectedAntenna)) {
+                clearInterval(timer);
+                resolve(true);
+                return;
+            }
+
+            if (Date.now() - start >= timeout) {
+                clearInterval(timer);
+                reject(new Error(`Timeout waiting for Ant. ${expectedAntenna}, last seen Z=${interceptedZData ?? 'none'}`));
+            }
+        }, interval);
+    });
+}
+
+// Function for first run on startup
+function startPluginStartup() {
+    logInfo(`[${pluginName}] Waiting for ${deviceName}...`);
+    // First run begins once default frequency is detected	
+    isFirstRun = true;
+    updateSpectrumData({ isFirstRun });
+    isFirstFirmwareNotice = false;
+    isModule = deviceConfig !== 'xdr';
+    isFirmwareDetected = false;
+    firmwareType = deviceConfig === 'xdr' ? 'XDR' : 'unknown';
+
+    // If default frequency is enabled in config
+    if (config.enableDefaultFreq) {
+        const checkFrequencyInterval = 100;
+        const timeoutDuration = 30000;
+
+        let isFrequencyMatched = false;
+
+        let intervalId = setInterval(() => {
+            if (Number(config.defaultFreq).toFixed(2) === Number(currentFrequency).toFixed(2)) {
+                isFrequencyMatched = true;
+                connectionStatusKnown = true;
+                clearInterval(intervalId);
+                initialDelay = 2000;
+                firstRun();
+            }
+        }, checkFrequencyInterval);
+
+        setTimeout(() => {
+            if (!isFrequencyMatched) {
+                clearInterval(intervalId);
+                logError(`[${pluginName}] Default Frequency does not match current frequency, continuing anyway.`);
+                initialDelay = 30000;
+                connectionStatusKnown = false;
+                firstRun();
+            }
+        }, timeoutDuration);
+    } else {
+        // If default frequency is disabled in config
+        async function waitForFrequency(timeout = 30000) { // First run begins once frequency is detected
+            const checkInterval = 100;
+
+            return new Promise((resolve, reject) => {
+                const startTime = Date.now();
+
+                const checkFrequency = setInterval(() => {
+                    const freq = Number(currentFrequency).toFixed(2);
+
+                    if (freq > 0.00) {
+                        clearInterval(checkFrequency);
+                        initialDelay = 3000;
+                        connectionStatusKnown = true;
+                        firstRun();
+                        resolve();
+                    }
+
+                    if (Date.now() - startTime >= timeout) {
+                        clearInterval(checkFrequency);
+                        logWarn(`[${pluginName}] No frequency detected after ${timeout/1000}s, using default ${config.defaultFreq || 87.5} MHz.`);
+                        currentFrequency = config.defaultFreq || 87.5;
+                        initialDelay = 3000;
+                        connectionStatusKnown = false;
+                        firstRun();
+                        resolve();
+                    }
+                }, checkInterval);
+            });
+        }
+
+        waitForFrequency()
+            .then(() => {
+                if (debug) {
+                    logInfo(`[${pluginName}] Frequency detected or default used.`);
+                }
+            })
+            .catch(error => logError(error));
+    }
+
+    async function firstRun() {
+        if (connectionStatusKnown) {
+            const connectionMsg = `${deviceName}${!useHooks ? ' and WebSocket' : ''} connected`;
+            logInfo(`[${pluginName}] ${connectionMsg}${!restartCounter ? ', preparing first run...' : `... (${restartCounter} ${restartCounter === 1 ? 'restart' : 'restarts'})`}`);
+            if (!isDeviceCompatible) logInfo(`[${pluginName}] Notice: Compatibility with device ${deviceName} might be limited.`);
+            connectionStatusKnown = false; // prepare for any reconnections
+        } else {
+            logInfo(`[${pluginName}] ${deviceName} connection status unknown,${!useHooks ? ' WebSocket connected,' : ''} preparing first run...`);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, initialDelay));
+
+        // Remember the tuner's current antenna to restore after scanning
+        const liveAntenna = Number(datahandlerReceived.dataToSend?.ant);
+        const startupAntenna = Number.isInteger(liveAntenna) && liveAntenna >= 0 ? liveAntenna : (antennaCurrent ?? 0);
+
+        // Confirm startup antenna before first scan
+        if (antennaSwitch) {
+            try {
+                interceptedZData = null;
+                await sendCommandToClient(`Z${startupAntenna}`);
+                if (debug) logInfo(`[${pluginName}] Waiting for Ant. ${startupAntenna} confirmation...`);
+                await waitForAntenna(startupAntenna, 5000);
+                logInfo(`[${pluginName}] Ant. ${startupAntenna} found, starting first scan.`);
+            } catch (error) {
+                logWarn(`[${pluginName}] Ant. ${startupAntenna} confirmation failed before first scan: ${error.message}`);
+            }
+        }
+
+        // First scan
+        await startScan('scan');
+
+        // Scan additional antennas sequentially
+        if (antennaResponse.enabled) {
+            const antennas = [
+                { enabled: antennaResponse.ant1.enabled, command: 'Z0', number: 0 },
+                { enabled: antennaResponse.ant2.enabled, command: 'Z1', number: 1 },
+                { enabled: antennaResponse.ant3.enabled, command: 'Z2', number: 2 },
+                { enabled: antennaResponse.ant4.enabled, command: 'Z3', number: 3 }
+            ];
+
+            for (const antenna of antennas) {
+                // Skip disabled antennas and startup antenna
+                if (!antenna.enabled || antenna.number === startupAntenna) continue;
+
+                try {
+                    // Delay before switching antenna
+                    await new Promise(resolve => setTimeout(resolve, 400));
+
+                    interceptedZData = null;
+                    await sendCommandToClient(antenna.command);
+                    if (debug) logInfo(`[${pluginName}] Waiting for Ant. ${startupAntenna} confirmation...`);
+                    await waitForAntenna(antenna.number, 5000);
+                    logInfo(`[${pluginName}] Ant. ${antenna.number} found, starting scan.`);
+
+                    // Delay as a precaution for UI and hardware switching
+                    await new Promise(resolve => setTimeout(resolve, 600));
+
+                    await startScan('scan');
+                } catch (error) {
+                    logWarn(`[${pluginName}] Ant. ${antenna.number} scan failed: ${error.message}`);
+                }
+            }
+
+            // Return to startup antenna
+            await new Promise(resolve => setTimeout(resolve, 600));
+            await sendCommandToClient(`Z${startupAntenna}`);
+        }
+
+        // First run complete
+        if (isFirstRun && !isFirstFirmwareNotice) {
+            isFirstFirmwareNotice = true;
+            // Only XDR skips the module/radio test entirely, so it is declared rather than detected
+            logInfo(`[${pluginName}] Firmware ${deviceConfig === 'xdr' ? 'operational' : 'detected'} as ${deviceConfig === 'tef' || deviceConfig === 'si47xx' ? firmwareType : deviceName}.`);
+        }
+
+        isFirstRun = false;
+        updateSpectrumData({ isFirstRun });
+        logInfo(`[${pluginName}] Scan button unlocked${!restartCounter ? ', first run complete' : ''}.`);
+    }
+}
+
+async function sendCommandToClient(command) {
+    try {
+        // Pass true for plugin-internal bypass
+        const privilegedSuccess = await sendPrivilegedCommand(command, true);
+
+        if (privilegedSuccess) {
+            return;
+        }
+
+        // Fallback only if privileged fails
+        logWarn(`${pluginName}: Privileged send failed for: ${command}`);
+    } catch (error) {
+        logError(`${pluginName}: Failed to send command:`, error);
+    }
+}
+
+// kHz to 'Sf' filter index. TEF values match the TEF668X firmware, XDR values match XDR-GTK's filters_legacy table.
+const FILTER_INDEX_TEF = { 56: 0, 64: 26, 72: 1, 84: 28, 97: 29, 114: 3, 133: 4, 151: 5, 168: 7, 184: 8, 200: 9, 217: 10, 236: 11, 254: 12, 287: 13, 311: 15 };
+const FILTER_INDEX_XDR = { 9: 31, 15: 16, 17: 17, 20: 18, 24: 19, 27: 20, 32: 21, 36: 22, 42: 23, 48: 24, 55: 0, 63: 26, 73: 1, 83: 28, 90: 2, 95: 29, 108: 3, 125: 4, 142: 5, 159: 6, 177: 7, 194: 8, 211: 9, 229: 10, 246: 11, 263: 12, 281: 13, 298: 14, 309: 15 };
+
+const XDR_WIDTH_BY_INDEX = Object.fromEntries(Object.entries(FILTER_INDEX_XDR).map(([kHz, index]) => [index, Number(kHz)]));
+const TEF_WIDTH_BY_INDEX = Object.fromEntries(Object.entries(FILTER_INDEX_TEF).map(([kHz, index]) => [index, Number(kHz)]));
+
+function widthForIndex(index) {
+    return (deviceConfig === 'xdr' ? XDR_WIDTH_BY_INDEX : TEF_WIDTH_BY_INDEX)[index];
+}
+
+function filterIndexFor(bandwidth) {
+    if (deviceConfig === 'xdr' && bandwidth in FILTER_INDEX_XDR) return FILTER_INDEX_XDR[bandwidth];
+    return bandwidth in FILTER_INDEX_TEF ? FILTER_INDEX_TEF[bandwidth] : null;
+}
+
+// Module firmware snaps 'Sw' to its nearest filter, matching Bandwidth::lookup() over LITHIO_BANDWIDTH_FM
+const TEF_WIDTHS = Object.keys(FILTER_INDEX_TEF).map(Number);
+
+function nearestTefWidth(bandwidth) {
+    return TEF_WIDTHS.reduce((best, w) => Math.abs(bandwidth - w) < Math.abs(bandwidth - best) ? w : best, TEF_WIDTHS[0]);
+}
+
+// Si47XX firmware rounds 'Sw' down to the chip's fixed FM filters
+const SI47XX_WIDTHS = [40, 60, 84, 110];
+
+// AM widths for the Band Definitions list. XDR keeps the TEF set, as its own AM widths are unverified
+const TEF_AM_WIDTHS = [3, 4, 6, 8];
+const SI47XX_AM_WIDTHS = [1, 1.8, 2, 2.5, 3, 4, 6];
+
+function si47xxWidth(bandwidth) {
+    return bandwidth >= 100 ? 110 : bandwidth >= 80 ? 84 : bandwidth >= 60 ? 60 : 40;
+}
+
+// The width the tuner will actually use, or null while the firmware is still unknown
+function effectiveBandwidth(bandwidth) {
+    if (deviceConfig === 'si47xx') return si47xxWidth(bandwidth); // Only Si47XX firmware drives this chip, and it always applies 'Sw'
+    if (deviceConfig !== 'xdr' && !isFirmwareDetected) return null; // A declared XDR never relies on detection
+    if (isModule) return nearestTefWidth(bandwidth);
+    // Radio and XDR take the index, and an unlisted width falls back to filter 0
+    const index = filterIndexFor(bandwidth);
+    return widthForIndex(index === null ? 0 : index);
+}
+
+function isHfScanCommand(command) {
+    if (command === 'scan-1' || command === 'scan-2') {
+        const range = formattedCustomRanges[command === 'scan-1' ? 0 : 1];
+        return !!range && range.low < 30;
+    }
+    return command === 'scan' && currentFrequency < 30;
+}
+
+function warnUnsupportedStep(lowerScaled, step) {
+    if (deviceConfig === 'si47xx' && lowerScaled >= 64000 && step % 10 !== 0) {
+        logWarn(`[${pluginName}] ${step} kHz is not a supported ${deviceName} FM step, frequencies are rounded down to 10 kHz.`);
+    }
+}
+
+// Module firmware takes the bandwidth in Hz, radio firmware takes an index. Returns the index, or null on module firmware
+function sendBandwidthCommand(bandwidth, isAm) {
+    if (hasFilterTable && !isAm && bandwidth !== 0) {
+        // Reported on every scan, as a bandwidth the tuner cannot use stays wrong until the config is corrected
+        const actual = effectiveBandwidth(bandwidth);
+        if (actual === null ? filterIndexFor(bandwidth) === null : actual !== bandwidth) {
+            logWarn(`[${pluginName}] ${bandwidth} kHz is not a supported ${deviceName} filter width${actual === null ? '' : `, using ${actual} kHz`}.`);
+        }
+    }
+
+    if (isModule && isFirmwareDetected && !sendBothBandwidthCommands) {
+        sendCommandToClient(`Sw${bandwidth === 3 ? 3000 : bandwidth * 1000}`);
+        scanSequence = 'Sw';
+        return null;
+    }
+
+    // XDR-GTK sends the index first then the Hz form, so a tuner that understands either lands on the right bandwidth
+    const sendHzForm = sendBothBandwidthCommands || (deviceConfig === 'xdr' ? XDR_SENDS_HZ_FORM : !isFirmwareDetected);
+
+    let BWradio = bandwidth === 0 ? -1 : 0; // -1 is the protocol's adaptive filter, as XDR-GTK sends for Auto
+    if (bandwidth !== 3 && bandwidth !== 0) {
+        const index = filterIndexFor(bandwidth);
+        if (index !== null) BWradio = index;
+    }
+    sendCommandToClient(`Sf${BWradio}`);
+    scanSequence = 'Sf';
+    if (sendHzForm) {
+        sendCommandToClient(`Sw${bandwidth === 3 ? 3000 : bandwidth * 1000}`);
+        scanSequence += `${scanSequence ? ', ' : ''}Sw`;
+    }
+    return BWradio;
+}
+
+// Begin scan
+async function startScan(command) {
+    if (debug) console.log(command);
+
+    // Route scan commands and track last explicitly chosen scan
+    if (command === 'scan-0') {
+        lastScanCommand = 'scan-0';
+        command = 'scan-fm';
+    } else if (command === 'scan') {
+        if (lastScanCommand && lastScanCommand !== 'scan') {
+            let matchesLastScan = false;
+            if (lastScanCommand === 'scan-0') {
+                matchesLastScan = currentFrequency >= fmLowerLimit;
+            } else {
+                const idx = Number(lastScanCommand.split('-')[1]) - 1;
+                const range = formattedCustomRanges[idx];
+                if (range) matchesLastScan = currentFrequency >= range.low && currentFrequency <= range.high;
+            }
+            if (matchesLastScan && lastScanCommand !== 'scan-0') {
+                command = lastScanCommand; // redirect to custom range
+            }
+            // scan-0: fall through to current-band logic so tuningRange is applied
+        }
+    } else {
+        lastScanCommand = command; // scan-1, scan-2
+    }
+
+    // Exit if scan is running
+    if (isScanRunning) return;
+
+    const SCALE = 1000;
+
+    // Restrict to config tuning limit, else 0-108 MHz
+    let tuningLimit = config.webserver.tuningLimit;
+    let tuningLowerLimit = tuningLimit === false ? 0 : config.webserver.tuningLowerLimit;
+    let tuningUpperLimit = tuningLimit === false ? 108 : config.webserver.tuningUpperLimit;
+
+    if (isNaN(currentFrequency) || currentFrequency === 0.0) {
+        currentFrequency = tuningLowerLimit;
+    }
+
+    // Checked before the graph is cleared, so a blocked scan leaves the last one on screen
+    if (disableHfScanning && isHfScanCommand(command)) {
+        logWarn(`${pluginName}: HF scanning is disabled.`);
+        return;
+    }
+
+    // Scan started
+    isScanHalted(false);
+
+    if (clearGraphOnScan) {
+        updateSpectrumData({ sd: null, isScanComplete: true });
+    }
+
+    const currentFrequencyScaled = Math.round(currentFrequency * SCALE);
+    const fmLowerLimitScaled = fmLowerLimit * SCALE;
+
+    let tuningLowerLimitScan = currentFrequencyScaled;
+    let tuningUpperLimitScan = currentFrequencyScaled;
+
+    let activeStepSize = tuningStepSize;
+    let activeBandwidth = tuningBandwidth;
+
+    const DEFINED_BANDS = definedBands;
+
+    // DEFINED_BANDS covers LW/MW/SW bands and OIRT
+    let foundBand = null;
+    for (let b of DEFINED_BANDS) {
+        if (currentFrequencyScaled >= b.start && currentFrequencyScaled <= b.end) {
+            foundBand = b;
+            break;
+        }
+    }
+
+    if (foundBand) {
+        tuningLowerLimitScan = foundBand.start;
+        tuningUpperLimitScan = foundBand.end;
+        activeStepSize = foundBand.step;
+        activeBandwidth = foundBand.bw;
+    } else if (currentFrequencyScaled < 64000) {
+        tuningLowerLimitScan = Math.max(144, currentFrequencyScaled - 500);
+        tuningUpperLimitScan = Math.min(hfUpperLimit * SCALE, currentFrequencyScaled + 500);
+        activeStepSize = 3;
+        activeBandwidth = 3;
+    } else {
+        // 64 MHz+
+        const tuningLowerLimitScaled = Math.round(tuningLowerLimit * SCALE);
+        const tuningUpperLimitScaled = Math.round(tuningUpperLimit * SCALE);
+
+        tuningLowerLimitScan = tuningLowerLimitScaled;
+        tuningUpperLimitScan = tuningUpperLimitScaled;
+
+        if (tuningRange) {
+            const tuningRangeScaled = tuningRange * SCALE;
+            tuningLowerLimitScan = currentFrequencyScaled - tuningRangeScaled;
+            tuningUpperLimitScan = currentFrequencyScaled + tuningRangeScaled;
+        }
+
+        if (tuningUpperLimitScan > tuningUpperLimitScaled) tuningUpperLimitScan = tuningUpperLimitScaled;
+        if (tuningLowerLimitScan < tuningLowerLimitScaled) tuningLowerLimitScan = tuningLowerLimitScaled;
+        if (tuningLowerLimitScan < 64000) tuningLowerLimitScan = 64000;
+
+        // Split at fmLowerLimit, OIRT and FM are separate scans
+        if (currentFrequencyScaled < fmLowerLimitScaled && tuningUpperLimitScan > fmLowerLimitScaled) tuningUpperLimitScan = fmLowerLimitScaled;
+        if (currentFrequencyScaled >= fmLowerLimitScaled && tuningLowerLimitScan < fmLowerLimitScaled) tuningLowerLimitScan = fmLowerLimitScaled;
+
+        // When tuningRange is clipped by a band boundary, extend the opposite edge
+        if (tuningRange) {
+            const tuningRangeScaled = tuningRange * SCALE;
+            const lowerShortfall = tuningLowerLimitScan - (currentFrequencyScaled - tuningRangeScaled);
+            if (lowerShortfall > 0) {
+                tuningUpperLimitScan = Math.min(tuningUpperLimitScaled, tuningUpperLimitScan + lowerShortfall);
+            }
+            const upperShortfall = (currentFrequencyScaled + tuningRangeScaled) - tuningUpperLimitScan;
+            if (upperShortfall > 0) {
+                const effectiveFloor = Math.max(tuningLowerLimitScaled, currentFrequencyScaled >= fmLowerLimitScaled ? fmLowerLimitScaled : 64000);
+                tuningLowerLimitScan = Math.max(effectiveFloor, tuningLowerLimitScan - upperShortfall);
+            }
+        }
+
+        activeStepSize = tuningStepSize;
+        activeBandwidth = tuningBandwidth;
+    }
+
+
+    if (command === 'scan-fm') {
+        // FM button always scans the FM band regardless of current frequency
+        tuningLowerLimitScan = fmLowerLimitScaled;
+        tuningUpperLimitScan = Math.round(tuningUpperLimit * SCALE);
+        activeStepSize = tuningStepSize;
+        activeBandwidth = tuningBandwidth;
+        command = 'scan'; // fall through to the scan send block below
+    }
+
+    // The magic happens here
+    if (command === 'scan') {
+        if (currentFrequency < fmLowerLimit && disableScanBelowFmLowerLimit && currentFrequencyScaled >= 64000) {
+            isScanHalted(true);
+            logWarn(`${pluginName}: Scanning below ${fmLowerLimit} MHz is disabled.`);
+            return;
+        } else {
+            warnUnsupportedStep(tuningLowerLimitScan, activeStepSize);
+            sendCommandToClient(`Sa${tuningLowerLimitScan}`);
+            sendCommandToClient(`Sb${tuningUpperLimitScan}`);
+            sendCommandToClient(`Sc${activeStepSize}`);
+            
+            const BWradio = sendBandwidthCommand(activeBandwidth, tuningLowerLimitScan < 30000);
+            sendCommandToClient('S');
+
+            structureCustomRanges();
+
+            if (debug) {
+                console.log(`Sa${tuningLowerLimitScan}`);
+                console.log(`Sb${tuningUpperLimitScan}`);
+                console.log(`Sc${activeStepSize}`);
+                console.log(isModule && isFirmwareDetected && !sendBothBandwidthCommands ? `Sw${activeBandwidth === 3 ? 3000 : activeBandwidth * 1000}` : `Sf${BWradio}`);
+                if (sendBothBandwidthCommands || (deviceConfig === 'xdr' ? XDR_SENDS_HZ_FORM : !isFirmwareDetected)) console.log(`Sw${activeBandwidth === 3 ? 3000 : activeBandwidth * 1000}`);
+                console.log('S');
+            }
+        }
+    } else if (command === 'scan-1' || command === 'scan-2') {
+        const rangeIndex = command === 'scan-1' ? 0 : 1;
+        const range = formattedCustomRanges[rangeIndex];
+
+        if (!range) {
+            isScanHalted(true);  // halt any ongoing scan
+            logWarn(`${pluginName}: Custom range ${command} not defined. Falling back to FM scan.`);
+            
+            // reset scan state so next scan can run
+            isScanRunning = false; 
+            lastScanCommand = 'scan'; 
+
+            // optionally restart normal scan automatically
+            return startScan('scan');
+        }
+
+        // proceed with valid custom range
+        let rangeLowerScaled = Math.round(range.low * SCALE);
+        let rangeUpperScaled = Math.round(range.high * SCALE);
+
+        if (rangeLowerScaled < 30000) {
+            if (rangeLowerScaled < 144) rangeLowerScaled = 144;
+            if (rangeUpperScaled > hfUpperLimit * SCALE) rangeUpperScaled = hfUpperLimit * SCALE;
+            if (!disableHfSpanLimit && rangeUpperScaled - rangeLowerScaled > 3000) {
+                rangeUpperScaled = rangeLowerScaled + 3000;
+                logWarn(`${pluginName}: Custom AM range too large. Clamped to 3 MHz span.`);
+            }
+            activeStepSize = range.step ?? (rangeLowerScaled <= 1710 ? 1 : 2);
+            activeBandwidth = 3;
+        } else {
+            if (rangeLowerScaled < 64000) rangeLowerScaled = 64000;
+            if (rangeUpperScaled > 108000) rangeUpperScaled = 108000;
+            activeStepSize = range.step ?? (rangeUpperScaled <= fmLowerLimitScaled ? 30 : tuningStepSize);
+            activeBandwidth = rangeUpperScaled <= fmLowerLimitScaled ? (deviceConfig === 'si47xx' ? 40 : deviceConfig === 'xdr' ? 55 : 56) : tuningBandwidth;
+        }
+
+        if (rangeUpperScaled <= rangeLowerScaled) {
+            isScanHalted(true);
+            logWarn(`${pluginName}: Custom range ${range.low}-${range.high} MHz falls outside the tuner's 0.144-${hfUpperLimit} and 64-108 MHz coverage.`);
+            return;
+        }
+
+        // Used below for the scan-success message's reported bounds
+        tuningLowerLimitScan = rangeLowerScaled;
+        tuningUpperLimitScan = rangeUpperScaled;
+
+        warnUnsupportedStep(rangeLowerScaled, activeStepSize);
+        sendCommandToClient(`Sa${rangeLowerScaled}`);
+        sendCommandToClient(`Sb${rangeUpperScaled}`);
+        sendCommandToClient(`Sc${activeStepSize}`);
+        
+        sendBandwidthCommand(activeBandwidth, rangeLowerScaled < 30000);
+
+        sendCommandToClient('S');
+
+        structureCustomRanges();
+        isScanRunning = true;
+    }
+
+    // Log scan command
+    //isInternalScan = false; // used for fallback only
+
+    scanStatus = { scanStatus: "scanning" };
+    updateSpectrumData(scanStatus);
+
+    // Kept with the stored data so a client loading later can use the same axis as the scan that produced it
+    updateSpectrumData({
+        scanLowerFreq: tuningLowerLimitScan / SCALE,
+        scanUpperFreq: tuningUpperLimitScan / SCALE
+    });
+
+    // Notify clients scan was initiated
+    const messageClient = {
+        type: 'spectrum-graph-scan-success',
+        scanSuccess: true,
+        scanLowerFreq: tuningLowerLimitScan / SCALE,
+        scanUpperFreq: tuningUpperLimitScan / SCALE
+    };
+
+    sendSigArray(null, {}, messageClient);
+
+    if (logLocalCommands || 
+        (!logLocalCommands && ipAddress !== '127.0.0.1' && !ipAddress.includes('ws://')) || 
+        isFirstRun
+    ) {
+        logInfo(`[${pluginName}] Spectral commands sent${scanSequence ? ` including ${scanSequence}` : ''}${firmwareType !== 'unknown' ? ` to ${firmwareType}` : ''} (${ipAddress})`);
+    }
+
+    // Reset data before receiving new data
+    interceptedUData = null;
+    interceptedZData = null;
+    sigArray = [];
+    liveScanBuffer = '';
+    liveScanCapturing = false;
+    if (scanBatchTimer) clearTimeout(scanBatchTimer);
+    scanBatchTimer = null;
+    pendingScanPoints = [];
+    throttleWarnedThisScan = false;
+
+    // Wait for U value using async
+    async function waitForUValue(timeout = 8000 + (isFirstRun ? 22000 : 0), interval = 10) {
+        const waitStartTime = process.hrtime(); // Start of waiting period
+
+        while (true) {
+            const elapsedTimeInNanoseconds = process.hrtime(waitStartTime);
+            const elapsedTimeInMilliseconds = (elapsedTimeInNanoseconds[0] * 1000) + (elapsedTimeInNanoseconds[1] / 1e6); // Convert to milliseconds
+
+            if (elapsedTimeInMilliseconds >= timeout) {
+                throw new Error(`${pluginName} timed out`); // Throw error if timed out
+            }
+
+            if (interceptedUData !== null && interceptedUData !== undefined) {
+                return interceptedUData; // Return when data is fetched
+            }
+
+            await new Promise(resolve => setTimeout(resolve, interval)); // Wait for next check
+        }
+    }
+
+    try {
+        const scanStartTime = process.hrtime();
+        let uValue = await waitForUValue();
+
+        // Possibly interrupted, but should never execute, as trailing commas should have already been removed
+        if (uValue && uValue.endsWith(',')) {
+            isScanHalted(true);
+            uValue = null;
+            setTimeout(() => {
+                // Update endpoint
+                const newData = { sd: uValue }; // uValue or null
+                updateSpectrumData(newData);
+                logWarn(`[${pluginName}] Spectrum scan appears incomplete.`);
+                scanStatus = { scanStatus: "incomplete" };
+                updateSpectrumData(scanStatus);
+            }, 200);
+        }
+        if (debug) console.log(uValue);
+
+        scanStatus = { scanStatus: "normal" };
+        updateSpectrumData(scanStatus);
+
+        const completeTimeInNanoseconds = process.hrtime(scanStartTime);
+        const completeTime = (completeTimeInNanoseconds[0] + completeTimeInNanoseconds[1] / 1e9).toFixed(1); // Convert to seconds
+
+        if (logLocalCommands ||
+            (!logLocalCommands && ipAddress !== '127.0.0.1' && !ipAddress.includes('ws://')) ||
+            isFirstRun
+        ) {
+            // Determine lower/upper frequencies
+            let logLower = tuningLowerLimitScan;
+            let logUpper = tuningUpperLimitScan;
+
+            // Override with the range values of custom range scan
+            if (command.startsWith('scan-') && command !== 'scan-0') {
+                const idx = Number(command.split('-')[1]) - 1;
+                if (formattedCustomRanges[idx]) {
+                    logLower = formattedCustomRanges[idx].low * 1000;
+                    logUpper = formattedCustomRanges[idx].high * 1000;
+                }
+            } else if (command === 'scan-0') {
+                // Default FM scan
+                logLower = tuningLowerLimitScan;
+                logUpper = tuningUpperLimitScan;
+            }
+
+            logInfo(`[${pluginName}] Spectrum ${command} (${logLower / 1000}-${logUpper / 1000} MHz, ${activeStepSize} kHz steps, ${activeBandwidth} kHz BW) ${antennaResponse.enabled ? `for Ant. ${antennaCurrent} ` : ''}complete in ${completeTime} seconds.`);
+        }
+
+        if (!isFirstRun) lastRestartTime = Date.now();
+
+        // Split response into pairs and process each one
+        sigArray = uValue.split(',').map(pair => {
+            const [freq, sig] = pair.split('=');
+            return { freq: (freq / 1000).toFixed(3), sig: parseFloat(sig).toFixed(1) };
+        });
+
+        // if (debug) console.log(sigArray);
+
+        const messageClient = JSON.stringify({
+            type: 'sigArray',
+            value: sigArray,
+            isScanning: isScanRunning
+        });
+
+        sendSigArray(sigArray, { pluginBroadcast: true }); // Send data
+
+    } catch (error) {
+        scanStatus = { scanStatus: "timeout" };
+        updateSpectrumData(scanStatus);
+        logError(`${pluginName} scan incomplete, invalid response from device ${deviceName} (invalid 'U' value), error:`, error.message);
+    }
+    isScanHalted(true);
+}
+
+function sendSigArray(sigArray, options = {}, customMessage) {
+    // Broadcast server-side if requested
+    const messageClient = customMessage
+        ? JSON.stringify(customMessage)
+        : JSON.stringify({
+            type: 'sigArray',
+            value: sigArray,
+            isScanning: isScanRunning
+        });
+
+    // Broadcast server-side if sigArray
+    if (!customMessage && options.pluginBroadcast) {
+        emitPluginEvent('sigArray', sigArray, { broadcast: false });
+    }
+
+    // Broadcast client-side only
+    if (useHooks) {
+        broadcastToPluginClients(messageClient);
+    } else if (extraSocket && extraSocket.readyState === WebSocket.OPEN) {
+        extraSocket.send(messageClient);
+    } else if (!customMessage) {
+        logError(`${pluginName}: No extraSocket for sigArray broadcast`);
+    }
+}
+
+function isScanHalted(status) {
+    if (status) {
+        isScanRunning = false;
+    } else {
+        isScanRunning = true;
+    }
+}
+
+// 'notify' sends the cooldown notice back to whoever asked, so other clients aren't told about a scan they never requested
+function restartScan(command, notify) {
+    // startScan() clears the shared buffers, so a concurrent scan would disrupt the one already running
+    if (isFirstRun || isScanRunning) {
+        logWarn(`[${pluginName}] Scan request ignored, ${isScanRunning ? 'a scan is already running' : 'first run is still in progress'}.`);
+        return;
+    }
+
+    nowTime = Date.now();
+
+    if (!isFirstRun && nowTime - lastRestartTime < (rescanDelay * 1000)) {
+        const retryIn = (((rescanDelay * 1000) - (nowTime - lastRestartTime)) / 1000).toFixed(1);
+        logWarn(`[${pluginName}] Cooldown mode, can retry in ${retryIn} seconds.`);
+
+        if (notify) notify({ type: 'spectrum-graph-cooldown', value: Number(retryIn) });
+
+        scanStatus = { scanStatus: "rejected" };
+        updateSpectrumData(scanStatus);
+
+        setTimeout(() => {
+            scanStatus = { scanStatus: "normal" };
+            updateSpectrumData(scanStatus);
+        }, 1000);
+
+        return;
+    }
+
+    lastRestartTime = nowTime;
+
+    // Restart scan
+    if (!isScanRunning) setTimeout(() => startScan(command), 80);
+}
+
+const getSpectrumData = () => {
+    return Object.freeze({ ...spectrumData });
+};
+
+module.exports = { getSpectrumData };
