@@ -80,6 +80,7 @@ jobs:
           rsync -av \
             --exclude='/.git/' \
             --exclude='/README.md' \
+            --exclude='/functional_image.png' \
             --exclude='/LICENSE' \
             /tmp/Logger/ \
             plugins/
