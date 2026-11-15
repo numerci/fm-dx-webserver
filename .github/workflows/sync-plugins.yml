@@ -29,12 +29,6 @@ jobs:
             https://github.com/Highpoint2000/LiveMap.git \
             /tmp/LiveMap
 
-      - name: Clone Logger
-        run: |
-          git clone --depth 1 \
-            https://github.com/Highpoint2000/webserver-logger.git \
-            /tmp/Logger
-
       - name: Clone Spectrum Graph
         run: |
           git clone --depth 1 \
@@ -73,16 +67,6 @@ jobs:
             --exclude='/LICENSE' \
             --exclude='/LiveMapQuickGuide.pdf' \
             /tmp/LiveMap/ \
-            plugins/
-
-      - name: Copy Logger files
-        run: |
-          rsync -av \
-            --exclude='/.git/' \
-            --exclude='/README.md' \
-            --exclude='/functional_image.png' \
-            --exclude='/LICENSE' \
-            /tmp/Logger/ \
             plugins/
 
       - name: Copy Spectrum Graph files
