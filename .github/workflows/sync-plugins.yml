@@ -29,6 +29,30 @@ jobs:
             https://github.com/Highpoint2000/LiveMap.git \
             /tmp/LiveMap
 
+      - name: Clone Logger
+        run: |
+          git clone --depth 1 \
+            https://github.com/Highpoint2000/webserver-logger.git \
+            /tmp/Logger
+
+      - name: Clone Spectrum Graph
+        run: |
+          git clone --depth 1 \
+            https://github.com/AmateurAudioDude/FM-DX-Webserver-Plugin-Spectrum-Graph.git \
+            /tmp/SpectrumGraph
+
+      - name: Clone S-Meter
+        run: |
+          git clone --depth 1 \
+            https://github.com/AmateurAudioDude/FM-DX-Webserver-Plugin-S-Meter.git \
+            /tmp/SMeter
+
+      - name: Clone Weather
+        run: |
+          git clone --depth 1 \
+            https://github.com/NoobishSVK/fm-dx-webserver-plugin-weather.git \
+            /tmp/Weather
+
       - name: Create plugins folder
         run: mkdir -p plugins
 
@@ -49,6 +73,42 @@ jobs:
             --exclude='/LICENSE' \
             --exclude='/LiveMapQuickGuide.pdf' \
             /tmp/LiveMap/ \
+            plugins/
+
+      - name: Copy Logger files
+        run: |
+          rsync -av \
+            --exclude='/.git/' \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            /tmp/Logger/ \
+            plugins/
+
+      - name: Copy Spectrum Graph files
+        run: |
+          rsync -av \
+            --exclude='/.git/' \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            /tmp/SpectrumGraph/ \
+            plugins/
+
+      - name: Copy S-Meter files
+        run: |
+          rsync -av \
+            --exclude='/.git/' \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            /tmp/SMeter/ \
+            plugins/
+
+      - name: Copy Weather files
+        run: |
+          rsync -av \
+            --exclude='/.git/' \
+            --exclude='/README.md' \
+            --exclude='/LICENSE' \
+            /tmp/Weather/ \
             plugins/
 
       - name: Verify files
